@@ -526,6 +526,416 @@ class QuerySyntaxErrorTests(unittest.TestCase):
         self.assertIn("str", str(ctx.exception))
 
 
+def optional_model():
+    """带 OPTIONAL/FILTER 测试所需事实与推理结论的模型。
+
+    显式：alice knows bob、bob knows carol、carol knows dave；
+          bob likes carol；alice/bob 各有 email，carol/dave 无 email。
+    推理：规则 knows-likes 推出 alice likes bob。
+    """
+    rules = [
+        {
+            "id": "knows-likes",
+            "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+        },
+    ]
+    doc = make_doc(
+        individuals=["alice", "bob", "carol", "dave"],
+        properties=["knows", "likes", "friendOf", "email"],
+        triples=[
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+            {"subject": "carol", "predicate": "knows", "object": "dave"},
+            {"subject": "bob", "predicate": "likes", "object": "carol"},
+            {"subject": "alice", "predicate": "email", "object": "a@x"},
+            {"subject": "bob", "predicate": "email", "object": "b@x"},
+        ],
+        rules=rules,
+    )
+    return parse(doc)
+
+
+class OptionalFilterQueryTests(unittest.TestCase):
+    def setUp(self):
+        self.model = optional_model()
+
+    def query(self, text):
+        return self.model.query(text)
+
+    def test_optional_left_join_keeps_unmatched_with_none(self):
+        # carol 是 knows 的主语但没有 email：保留一行且 ?e 未绑定为 None
+        result = self.query(
+            "SELECT ?x ?e WHERE { ?x knows ?y . OPTIONAL { ?x email ?e } }"
+        )
+        self.assertEqual(result.variables, ("?x", "?e"))
+        self.assertEqual(
+            result.rows,
+            (("alice", "a@x"), ("bob", "b@x"), ("carol", None)),
+        )
+
+    def test_optional_multiple_matches_expand_binding(self):
+        # ?y likes ?z：bob likes carol（显式），carol likes dave（由规则推出）；
+        # dave 无 likes 事实，最后一行 ?z 未绑定
+        result = self.query(
+            "SELECT ?x ?z WHERE { ?x knows ?y . OPTIONAL { ?y likes ?z } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (("alice", "carol"), ("bob", "dave"), ("carol", None)),
+        )
+
+    def test_optional_derived_triples_match_like_explicit(self):
+        # alice likes bob 与 carol likes dave 均由推理得出，应在 OPTIONAL 中命中
+        result = self.query(
+            "SELECT ?x ?z WHERE { ?x knows ?y . OPTIONAL { ?x likes ?z } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (("alice", "bob"), ("bob", "carol"), ("carol", "dave")),
+        )
+        self.assertEqual(
+            self.model.source_rule("alice", "likes", "bob"), "knows-likes"
+        )
+
+    def test_optional_inner_multiple_patterns_join(self):
+        result = self.query(
+            "SELECT ?x ?z WHERE { ?x knows ?y . "
+            "OPTIONAL { ?y knows ?z . ?z knows ?w } }"
+        )
+        # 仅 alice -> bob -> carol -> dave 一条链完整（?z=carol，?w=dave）；
+        # 其余种子块内无完整匹配，?z 未绑定
+        self.assertEqual(
+            result.rows,
+            (("alice", "carol"), ("bob", None), ("carol", None)),
+        )
+
+    def test_multiple_optionals_processed_in_order(self):
+        result = self.query(
+            "SELECT ?x ?e ?e2 WHERE { ?x knows ?y . "
+            "OPTIONAL { ?x email ?e } OPTIONAL { ?y email ?e2 } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "a@x", "b@x"),
+                ("bob", "b@x", None),
+                ("carol", None, None),
+            ),
+        )
+
+    def test_star_projection_includes_optional_variables(self):
+        result = self.query(
+            "SELECT * WHERE { ?x knows ?y . OPTIONAL { ?x email ?e } }"
+        )
+        self.assertEqual(result.variables, ("?x", "?y", "?e"))
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "bob", "a@x"),
+                ("bob", "carol", "b@x"),
+                ("carol", "dave", None),
+            ),
+        )
+
+    def test_explicit_projection_may_name_optional_variable(self):
+        result = self.query(
+            "SELECT ?e WHERE { ?x knows ?y . OPTIONAL { ?x email ?e } }"
+        )
+        # 仅投影 ?e 时两行未绑定去重为一个 None，与字符串行共同排序
+        self.assertEqual(result.variables, ("?e",))
+        self.assertEqual(result.rows, ((None,), ("a@x",), ("b@x",)))
+
+    def test_none_sorts_before_strings(self):
+        # 按 (?x, ?e) 排序：?x 全为字符串；同列存在 None 与字符串时 None 在前
+        result = self.query(
+            "SELECT ?y ?e WHERE { ?x knows ?y . OPTIONAL { ?y email ?e } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (("bob", "b@x"), ("carol", None), ("dave", None)),
+        )
+
+    def test_filter_bound(self):
+        result = self.query(
+            "SELECT ?x WHERE { ?x knows ?y . "
+            "OPTIONAL { ?x email ?e } FILTER (BOUND(?e)) }"
+        )
+        self.assertEqual(result.rows, (("alice",), ("bob",)))
+
+    def test_filter_not_bound(self):
+        result = self.query(
+            "SELECT ?x WHERE { ?x knows ?y . "
+            "OPTIONAL { ?x email ?e } FILTER (!BOUND(?e)) }"
+        )
+        self.assertEqual(result.rows, (("carol",),))
+
+    def test_filter_bound_on_required_variable_keeps_all(self):
+        result = self.query(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (BOUND(?y)) }"
+        )
+        self.assertEqual(result.rows, (("alice",), ("bob",), ("carol",)))
+
+    def test_filter_variable_equality_and_inequality(self):
+        eq = self.query(
+            "SELECT ?x ?y WHERE { ?x knows ?y . "
+            "OPTIONAL { ?x email ?e } FILTER (?x = ?y) }"
+        )
+        self.assertEqual(eq.rows, ())
+        ne = self.query(
+            "SELECT ?x ?y WHERE { ?x knows ?y . FILTER (?x != ?y) }"
+        )
+        self.assertEqual(
+            ne.rows,
+            (("alice", "bob"), ("bob", "carol"), ("carol", "dave")),
+        )
+
+    def test_filter_string_literal_comparisons(self):
+        self.assertEqual(
+            self.query(
+                'SELECT ?x WHERE { ?x knows ?y . FILTER (?x = "alice") }'
+            ).rows,
+            (("alice",),),
+        )
+        self.assertEqual(
+            self.query(
+                'SELECT ?x WHERE { ?x knows ?y . FILTER ("bob" != ?x) }'
+            ).rows,
+            (("alice",), ("carol",)),
+        )
+        self.assertEqual(
+            self.query(
+                'SELECT ?x WHERE { ?x knows ?y . FILTER ("a" = "a") }'
+            ).rows,
+            (("alice",), ("bob",), ("carol",)),
+        )
+        self.assertEqual(
+            self.query(
+                'SELECT ?x WHERE { ?x knows ?y . FILTER ("a" != "a") }'
+            ).rows,
+            (),
+        )
+        # 完整字符串精确比较
+        self.assertEqual(
+            self.query(
+                'SELECT ?x WHERE { ?x knows ?y . OPTIONAL { ?x email ?e } '
+                'FILTER (?e = "a@") }'
+            ).rows,
+            (),
+        )
+
+    def test_unbound_makes_both_eq_and_ne_false(self):
+        base = "SELECT ?x ?e WHERE { ?x knows ?y . OPTIONAL { ?x email ?e } "
+        # carol 的 ?e 未绑定：= 常量为假
+        self.assertEqual(
+            self.query(base + 'FILTER (?e = "b@x") }').rows,
+            (("bob", "b@x"),),
+        )
+        # 未绑定参与 != 同样为假：carol 行不保留
+        self.assertEqual(
+            self.query(base + 'FILTER (?e != "b@x") }').rows,
+            (("alice", "a@x"),),
+        )
+
+    def test_multiple_filters_combine_as_logical_and(self):
+        result = self.query(
+            'SELECT ?x WHERE { ?x knows ?y . '
+            'FILTER (?x != "alice") FILTER (?x != "carol") }'
+        )
+        self.assertEqual(result.rows, (("bob",),))
+
+    def test_filter_can_precede_optional(self):
+        result = self.query(
+            "SELECT ?x ?e WHERE { ?x knows ?y . "
+            'FILTER (?x = "alice") OPTIONAL { ?x email ?e } }'
+        )
+        self.assertEqual(result.rows, (("alice", "a@x"),))
+
+    def test_filter_reuses_optional_binding(self):
+        result = self.query(
+            "SELECT ?x ?e WHERE { ?x knows ?y . "
+            'OPTIONAL { ?x email ?e } FILTER (?e = "b@x") }'
+        )
+        self.assertEqual(result.rows, (("bob", "b@x"),))
+
+    def test_empty_required_result_yields_empty_with_optional(self):
+        result = self.query(
+            "SELECT ?x ?e WHERE { ?x knows nobody . OPTIONAL { ?x email ?e } }"
+        )
+        self.assertEqual(result.rows, ())
+
+    def test_rows_with_none_remain_immutable_tuples(self):
+        result = self.query(
+            "SELECT ?x ?e WHERE { ?x knows ?y . OPTIONAL { ?x email ?e } }"
+        )
+        self.assertTrue(all(isinstance(row, tuple) for row in result.rows))
+        with self.assertRaises(TypeError):
+            result.rows[0][0] = "x"
+
+    def test_clauses_separated_with_dots(self):
+        result = self.query(
+            "SELECT ?x ?e WHERE { ?x knows ?y . "
+            "OPTIONAL { ?x email ?e } . FILTER (BOUND(?e)) . }"
+        )
+        self.assertEqual(result.rows, (("alice", "a@x"), ("bob", "b@x")))
+
+    def test_clause_may_follow_complete_pattern_without_dot(self):
+        # 完整三元组后可直接跟 FILTER / OPTIONAL（与 '}' 前省略点号一致）
+        self.assertEqual(
+            self.query(
+                'SELECT ?x WHERE { ?x knows ?y FILTER (?x = "alice") }'
+            ).rows,
+            (("alice",),),
+        )
+        self.assertEqual(
+            self.query(
+                "SELECT ?x ?e WHERE { ?x knows ?y OPTIONAL { ?x email ?e } }"
+            ).rows,
+            (("alice", "a@x"), ("bob", "b@x"), ("carol", None)),
+        )
+
+    def test_query_without_clauses_still_matches_baseline(self):
+        with_clause_compatible = self.query(
+            "SELECT ?x ?y WHERE { ?x knows ?y }"
+        )
+        self.assertEqual(
+            with_clause_compatible.rows,
+            (
+                ("alice", "bob"),
+                ("bob", "carol"),
+                ("carol", "dave"),
+            ),
+        )
+
+    def test_repeated_execution_identical_with_clauses(self):
+        text = (
+            "SELECT * WHERE { ?x knows ?y . "
+            "OPTIONAL { ?x email ?e } FILTER (!BOUND(?e)) }"
+        )
+        first = self.query(text)
+        for _ in range(3):
+            self.assertEqual(self.query(text), first)
+
+
+class OptionalFilterSyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.model = optional_model()
+
+    def assertQueryError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(text)
+        message = str(ctx.exception)
+        self.assertTrue(
+            "字符位置" in message or "模式" in message,
+            f"错误消息缺少字符位置或模式序号: {message}",
+        )
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+
+    def test_optional_empty_group(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . OPTIONAL { } }"
+        )
+
+    def test_optional_nesting_rejected(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . "
+            "OPTIONAL { ?x knows ?z . OPTIONAL { ?z knows ?w } } }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . "
+            "OPTIONAL { ?x knows ?z . FILTER (BOUND(?z)) } }"
+        )
+
+    def test_optional_bad_structure(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . OPTIONAL ?x knows ?z }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . OPTIONAL { ?x knows ?z }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . OPTIONAL { ?x knows } }",
+            "模式 0", "项数不足",
+        )
+
+    def test_optional_requires_prior_required_pattern(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { OPTIONAL { ?x knows ?y } }"
+        )
+
+    def test_lowercase_clause_keywords_rejected(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . optional { ?x knows ?z } }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . filter (BOUND(?x)) }"
+        )
+
+    def test_filter_empty_or_incomplete(self):
+        self.assertQueryError("SELECT ?x WHERE { ?x knows ?y . FILTER }")
+        self.assertQueryError("SELECT ?x WHERE { ?x knows ?y . FILTER ( ) }")
+        self.assertQueryError("SELECT ?x WHERE { ?x knows ?y . FILTER (?x) }")
+        self.assertQueryError("SELECT ?x WHERE { ?x knows ?y . FILTER (BOUND) }")
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (BOUND(?x) }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (?x = ?y }"
+        )
+
+    def test_filter_unknown_expression_forms(self):
+        self.assertQueryError(
+            'SELECT ?x WHERE { ?x knows ?y . FILTER (BOUND("x")) }'
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (!?x) }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (!BOUND) }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (?x + ?y) }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (?x = knows) }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (?x = ) }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (?x = ?y = ?z) }"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (BOUND(?x) ?y) }"
+        )
+
+    def test_filter_unknown_variable(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (?z = ?w) }", "?z"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (BOUND(?z)) }", "?z"
+        )
+
+    def test_projection_variable_must_appear_in_any_pattern(self):
+        self.assertQueryError(
+            "SELECT ?w WHERE { ?x knows ?y . OPTIONAL { ?x knows ?z } }",
+            "?w",
+        )
+
+    def test_consecutive_dots_between_clauses_rejected(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . FILTER (BOUND(?x)) . . }"
+        )
+
+    def test_triple_pattern_after_clause_rejected(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y . "
+            "FILTER (BOUND(?x)) ?x knows ?z }"
+        )
+
+
 class ConsistencyValidationTests(unittest.TestCase):
     """consistency 段结构/取值错误应抛 OntologyError 并定位字段。"""
 
