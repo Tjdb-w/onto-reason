@@ -8,7 +8,9 @@
 
 ## 状态
 
-初始基线：只有本说明，尚无实现。
+- `OntologyEngine.parse(text)`：解析 JSON 本体定义，做规则前向链推理，返回只读的 `OntologyModel`。
+- `OntologyModel`：通过 `explicit_triples`、`derived_triples`、`triples`、`entails`、`source_rule` 暴露显式事实与推理结论。
+- `OntologyModel.query(text)`：执行 SPARQL 风格基本图模式查询，如 `SELECT ?x ?y WHERE { ?x knows ?y }`，返回 `QueryResult(variables, rows)`；显式事实与推理结论均可命中，结果去重并按字典序排列。
 
 ## 约定
 

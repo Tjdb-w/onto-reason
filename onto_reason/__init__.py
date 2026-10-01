@@ -3,6 +3,7 @@
 from .engine import OntologyEngine
 from .errors import OntologyError
 from .model import DerivedTriple, OntologyModel, Triple
+from .query import QueryResult
 
 __all__ = [
     "OntologyEngine",
@@ -10,4 +11,5 @@ __all__ = [
     "OntologyModel",
     "Triple",
     "DerivedTriple",
+    "QueryResult",
 ]
