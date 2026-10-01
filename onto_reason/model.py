@@ -125,9 +125,11 @@ class OntologyModel:
         return self._source.get(Triple(subject, predicate, object_))
 
     def query(self, text: str) -> QueryResult:
-        """执行 SPARQL 风格基本图模式查询，在显式与推理三元组上匹配。
+        """执行 SPARQL 风格 SELECT 查询，在显式与推理三元组上匹配。
 
         例如 SELECT ?x ?y WHERE { ?x knows ?y . ?y likes ?z }；
+        模式体中还可以出现 OPTIONAL { ... }（左连接，无匹配时块内变量未绑定）
+        与 FILTER ( 表达式 )（BOUND/!BOUND 与 =/!= 比较，多个 FILTER 逻辑与）。
         查询不修改模型，重复执行结果一致。词法或语法错误抛出 OntologyError。
         """
         return run_query(self, text)
