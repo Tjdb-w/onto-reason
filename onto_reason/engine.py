@@ -12,6 +12,10 @@
 
 推理：对规则做前向链推理直至不动点。结论按 (主语, 谓语, 宾语) 字典序输出，
 同一三元组被多条规则推出时保留最先推出它的规则 id；显式三元组优先于推理结论。
+
+根对象可选包含 consistency 字段做一致性诊断，其结构由 onto_reason.consistency
+模块校验：原有校验与不动点推理完成后再检查不相交类与函数属性约束，
+存在语义冲突时抛 InconsistencyError（OntologyError 的子类）且不返回模型。
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional, Tuple
 
+from .consistency import check_consistency, parse_consistency
 from .errors import OntologyError
 from .model import OntologyModel, Triple
 
@@ -54,6 +59,18 @@ class OntologyEngine:
         explicit = self._parse_explicit_triples(data["triples"], properties)
         rules = self._parse_rules(data["rules"], properties)
         derived = self._forward_chain(explicit, rules)
+        # consistency 段先做结构校验；语义冲突在原有校验与不动点推理之后检查。
+        spec = parse_consistency(
+            data, frozenset(data["classes"]), properties
+        )
+        if spec is not None:
+            check_consistency(
+                spec,
+                explicit,
+                derived,
+                frozenset(data["individuals"]),
+                frozenset(data["classes"]),
+            )
         return OntologyModel(explicit, derived)
 
     def __call__(self, text) -> OntologyModel:
