@@ -1,7 +1,13 @@
 import json
 import unittest
 
-from onto_reason import OntologyEngine, OntologyError, QueryResult, Triple
+from onto_reason import (
+    InconsistencyError,
+    OntologyEngine,
+    OntologyError,
+    QueryResult,
+    Triple,
+)
 
 
 def make_doc(**overrides):
@@ -518,6 +524,433 @@ class QuerySyntaxErrorTests(unittest.TestCase):
         with self.assertRaises(OntologyError) as ctx:
             self.model.query(123)
         self.assertIn("str", str(ctx.exception))
+
+
+class ConsistencyValidationTests(unittest.TestCase):
+    """consistency 段结构/取值错误应抛 OntologyError 并定位字段。"""
+
+    def test_consistency_must_be_object(self):
+        with self.assertRaises(OntologyError) as ctx:
+            parse(make_doc(consistency=[]))
+        self.assertIn("consistency", str(ctx.exception))
+
+    def test_consistency_wrong_key_set(self):
+        bad = {"classMembershipPredicate": "rdfType", "disjointClasses": []}
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=bad))
+        self.assertIn("functionalProperties", str(ctx.exception))
+        good_base = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [],
+            "functionalProperties": [],
+        }
+        extra = dict(good_base, bogus=1)
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=extra))
+        self.assertIn("bogus", str(ctx.exception))
+
+    def test_membership_predicate_must_be_declared_nonempty_string(self):
+        with self.assertRaises(OntologyError) as ctx:
+            parse(
+                consistency_doc(
+                    consistency={
+                        "classMembershipPredicate": "",
+                        "disjointClasses": [],
+                        "functionalProperties": [],
+                    }
+                )
+            )
+        self.assertIn("classMembershipPredicate", str(ctx.exception))
+        with self.assertRaises(OntologyError) as ctx:
+            parse(
+                consistency_doc(
+                    consistency={
+                        "classMembershipPredicate": "notDeclared",
+                        "disjointClasses": [],
+                        "functionalProperties": [],
+                    }
+                )
+            )
+        self.assertIn("notDeclared", str(ctx.exception))
+
+    def test_disjoint_item_bad_shape_and_id(self):
+        base = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [{"id": "d1"}],
+            "functionalProperties": [],
+        }
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("consistency['disjointClasses'][0]", str(ctx.exception))
+
+        base["disjointClasses"] = [{"id": "", "classes": ["Person", "Person"]}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("consistency['disjointClasses'][0]", str(ctx.exception))
+        self.assertIn("'id'", str(ctx.exception))
+
+        base["disjointClasses"] = [{"id": True, "classes": ["Person"]}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("id", str(ctx.exception))
+
+    def test_disjoint_classes_requirements(self):
+        base = {
+            "classMembershipPredicate": "rdfType",
+            "functionalProperties": [],
+        }
+        base["disjointClasses"] = [{"id": 1, "classes": ["Person"]}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("两个类", str(ctx.exception))
+
+        base["disjointClasses"] = [{"id": 1, "classes": ["Person", "Person"]}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("Person", str(ctx.exception))
+        self.assertIn("重复", str(ctx.exception))
+
+        base["disjointClasses"] = [{"id": 1, "classes": ["Person", "Ghost"]}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("Ghost", str(ctx.exception))
+        self.assertIn("未声明的类", str(ctx.exception))
+
+    def test_functional_item_validation(self):
+        base = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [],
+            "functionalProperties": [{"id": "f1"}],
+        }
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("consistency['functionalProperties'][0]", str(ctx.exception))
+
+        base["functionalProperties"] = [{"id": "f1", "property": ""}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("property", str(ctx.exception))
+
+        base["functionalProperties"] = [{"id": "f1", "property": "nope"}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("nope", str(ctx.exception))
+
+    def test_merged_ids_must_be_unique(self):
+        consistency = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [
+                {"id": 7, "classes": ["Person", "Other"]},
+            ],
+            "functionalProperties": [
+                {"id": 7, "property": "knows"},
+            ],
+        }
+        doc = consistency_doc(
+            classes=["Person", "Robot", "Animal", "Other"], consistency=consistency
+        )
+        with self.assertRaises(OntologyError) as ctx:
+            parse(doc)
+        self.assertIn("7", str(ctx.exception))
+        self.assertIn("重复", str(ctx.exception))
+
+    def test_integer_and_string_ids_distinct(self):
+        consistency = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [
+                {"id": 7, "classes": ["Person", "Other"]},
+            ],
+            "functionalProperties": [
+                {"id": "7", "property": "knows"},
+            ],
+        }
+        doc = consistency_doc(
+            classes=["Person", "Robot", "Animal", "Other"], consistency=consistency
+        )
+        # 7 与 "7" 不重复：无冲突时正常返回模型
+        model = parse(doc)
+        self.assertIsNotNone(model)
+
+    def test_consistency_arrays_wrong_type(self):
+        with self.assertRaises(OntologyError) as ctx:
+            parse(
+                consistency_doc(
+                    consistency={
+                        "classMembershipPredicate": "rdfType",
+                        "disjointClasses": {},
+                        "functionalProperties": [],
+                    }
+                )
+            )
+        self.assertIn("disjointClasses", str(ctx.exception))
+
+
+def consistency_doc(**overrides):
+    """带类型声明与成员属性的文档。"""
+    doc = make_doc(
+        classes=["Person", "Robot", "Animal"],
+        properties=["rdfType", "knows", "likes", "friendOf", "age"],
+    )
+    doc.update(overrides)
+    return doc
+
+
+def consistency_section(disjoint=None, functional=None, predicate="rdfType"):
+    return {
+        "classMembershipPredicate": predicate,
+        "disjointClasses": disjoint or [],
+        "functionalProperties": functional or [],
+    }
+
+
+class InconsistencyDetectionTests(unittest.TestCase):
+    def test_no_consistency_keeps_model(self):
+        model = parse(make_doc())
+        self.assertIsInstance(model.triples, tuple)
+
+    def test_consistency_without_conflict_returns_model(self):
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}],
+            functional=[{"id": "f1", "property": "age"}],
+        )
+        doc = consistency_doc(consistency=section)
+        model = parse(doc)
+        self.assertEqual(len(model.explicit_triples), 2)
+
+    def test_explicit_disjoint_conflict(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Robot", "Person"]}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        message = str(ctx.exception)
+        # 两个类名按字典序列出（Person 先于 Robot）
+        self.assertIn("Person", message)
+        self.assertLess(message.index("Person"), message.index("Robot"))
+        self.assertIn("d1", message)
+        self.assertIn("alice", message)
+        self.assertIn("explicit_triples", message)
+        self.assertIsInstance(ctx.exception, OntologyError)
+
+    def test_derived_membership_conflict_marks_source_rule(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-to-robot",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "rdfType", "object": "Robot"}],
+            }
+        ]
+        section = consistency_section(
+            disjoint=[{"id": 9, "classes": ["Person", "Robot"]}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(
+                consistency_doc(
+                    triples=triples, rules=rules, consistency=section
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("derived_triples", message)
+        self.assertIn("r-to-robot", message)
+        self.assertIn("explicit_triples", message)
+
+    def test_functional_conflict_duplicate_objects(self):
+        triples = [
+            {"subject": "alice", "predicate": "age", "object": "30"},
+            {"subject": "alice", "predicate": "age", "object": "31"},
+        ]
+        section = consistency_section(
+            functional=[{"id": "f-age", "property": "age"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        message = str(ctx.exception)
+        self.assertIn("age", message)
+        self.assertIn("30", message)
+        self.assertIn("31", message)
+        # object 按字典序列出
+        self.assertLess(message.index("'30'"), message.index("'31'"))
+
+    def test_functional_same_triple_not_conflict(self):
+        triples = [
+            {"subject": "alice", "predicate": "age", "object": "30"},
+            {"subject": "alice", "predicate": "age", "object": "30"},
+        ]
+        section = consistency_section(
+            functional=[{"id": "f-age", "property": "age"}]
+        )
+        model = parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(len(model.explicit_triples), 1)
+
+    def test_functional_conflict_derived_and_explicit(self):
+        triples = [
+            {"subject": "alice", "predicate": "age", "object": "30"},
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+        ]
+        rules = [
+            {
+                "id": "r-age",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "age", "object": "40"}],
+            }
+        ]
+        # alice 无冲突；bob 只有一个值也无冲突。改为让 bob 显式有一个值：
+        triples.append({"subject": "bob", "predicate": "age", "object": "50"})
+        section = consistency_section(
+            functional=[{"id": "f-age", "property": "age"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(
+                consistency_doc(
+                    triples=triples, rules=rules, consistency=section
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("bob", message)
+        self.assertIn("40", message)
+        self.assertIn("50", message)
+        self.assertIn("r-age", message)
+        # alice 仅有一个取值，不应出现
+        self.assertNotIn("个体 'alice'", message)
+
+    def test_membership_requires_declared_individual_and_class(self):
+        triples = [
+            {"subject": "ghost", "predicate": "rdfType", "object": "Person"},
+            {"subject": "ghost", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Thing"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}]
+        )
+        # ghost 未声明为个体；Thing 未声明为类：均不产生冲突
+        model = parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(len(model.triples), 3)
+
+    def test_conflicts_sorted_by_id_type_subject(self):
+        triples = [
+            {"subject": "bob", "predicate": "rdfType", "object": "Person"},
+            {"subject": "bob", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "age", "object": "1"},
+            {"subject": "alice", "predicate": "age", "object": "2"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": 2, "classes": ["Person", "Robot"]}],
+            functional=[{"id": 1, "property": "age"}],
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        lines = [ln for ln in str(ctx.exception).splitlines() if ln.startswith("[")]
+        # id 1 (functional) 在 id 2 (disjoint) 之前
+        self.assertIn("functionalProperties id=1", lines[0])
+        self.assertTrue(
+            any("disjointClasses id=2" in ln for ln in lines[1:]),
+            lines,
+        )
+        # 同一 id 内按 subject：alice 先于 bob
+        disjoint_lines = [ln for ln in lines if "disjointClasses" in ln]
+        self.assertIn("'alice'", disjoint_lines[0])
+        self.assertIn("'bob'", disjoint_lines[1])
+
+    def test_all_conflicts_listed(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Animal"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Animal", "Person", "Robot"]}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        message = str(ctx.exception)
+        # 三个类两两配对，共 3 条
+        self.assertEqual(message.count("[disjointClasses id='d1']"), 3)
+
+    def test_message_stable_across_parses_and_key_order(self):
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}],
+            functional=[{"id": "f1", "property": "age"}],
+        )
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "age", "object": "9"},
+            {"subject": "alice", "predicate": "age", "object": "1"},
+        ]
+        doc = consistency_doc(triples=triples, consistency=section)
+        messages = []
+        for _ in range(2):
+            with self.assertRaises(InconsistencyError) as ctx:
+                OntologyEngine().parse(json.dumps(doc))
+            messages.append(str(ctx.exception))
+        self.assertEqual(messages[0], messages[1])
+        # JSON 键顺序不同不影响消息
+        shuffled = {
+            "functionalProperties": section["functionalProperties"],
+            "rules": doc["rules"],
+            "triples": list(reversed(doc["triples"])),
+            "individuals": doc["individuals"],
+            "properties": doc["properties"],
+            "classes": doc["classes"],
+            "disjointClasses": None,
+        }
+        shuffled["consistency"] = {
+            "functionalProperties": section["functionalProperties"],
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": section["disjointClasses"],
+        }
+        del shuffled["disjointClasses"]
+        with self.assertRaises(InconsistencyError) as ctx:
+            OntologyEngine().parse(json.dumps(shuffled))
+        self.assertEqual(str(ctx.exception), messages[0])
+
+    def test_no_model_returned_on_inconsistency(self):
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}]
+        )
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+        ]
+        outcome = []
+
+        def parse_or_none():
+            try:
+                return parse(consistency_doc(triples=triples, consistency=section))
+            except InconsistencyError:
+                return None
+
+        self.assertIsNone(parse_or_none())
+        self.assertEqual(outcome, [])
+
+    def test_output_unchanged_when_consistent(self):
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}],
+            functional=[{"id": "f1", "property": "likes"}],
+        )
+        without = parse(consistency_doc())
+        with_section = parse(consistency_doc(consistency=section))
+        self.assertEqual(without.explicit_triples, with_section.explicit_triples)
+        self.assertEqual(without.derived_triples, with_section.derived_triples)
+        self.assertEqual(without.triples, with_section.triples)
+        query = "SELECT ?x ?y WHERE { ?x knows ?y }"
+        self.assertEqual(without.query(query), with_section.query(query))
+        self.assertEqual(
+            without.source_rule("alice", "knows", "bob"),
+            with_section.source_rule("alice", "knows", "bob"),
+        )
+        self.assertEqual(without.entails("alice", "knows", "bob"),
+                         with_section.entails("alice", "knows", "bob"))
 
 
 if __name__ == "__main__":
