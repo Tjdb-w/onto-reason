@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from onto_reason import OntologyEngine, OntologyError, Triple
+from onto_reason import OntologyEngine, OntologyError, QueryResult, Triple
 
 
 def make_doc(**overrides):
@@ -268,6 +268,256 @@ class DeterminismAndImmutabilityTests(unittest.TestCase):
         model = parse(make_doc(triples=triples, rules=[rule]))
         self.assertTrue(model.entails("alice", "likes", "alice"))
         self.assertFalse(model.entails("alice", "likes", "bob"))
+
+
+def query_model():
+    """带显式事实与推理结论的模型，供查询测试使用。"""
+    rules = [
+        {
+            "id": "knows-likes",
+            "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+        },
+        {
+            "id": "friend-of-friend",
+            "if": [
+                {"subject": "?x", "predicate": "knows", "object": "?y"},
+                {"subject": "?y", "predicate": "likes", "object": "?z"},
+            ],
+            "then": [{"subject": "?x", "predicate": "friendOf", "object": "?z"}],
+        },
+    ]
+    triples = make_doc()["triples"] + [
+        {"subject": "bob", "predicate": "likes", "object": "carol"}
+    ]
+    return parse(make_doc(triples=triples, rules=rules))
+
+
+class QueryTests(unittest.TestCase):
+    def test_basic_join_returns_query_result(self):
+        model = query_model()
+        result = model.query(
+            "SELECT ?x ?y WHERE { ?x knows ?y . ?y likes ?z }"
+        )
+        self.assertIsInstance(result, QueryResult)
+        self.assertEqual(result.variables, ("?x", "?y"))
+        self.assertEqual(result.rows, (("alice", "bob"),))
+
+    def test_star_projection_first_appearance_order(self):
+        model = query_model()
+        result = model.query(
+            "SELECT * WHERE { ?x knows ?y . ?y likes ?z }"
+        )
+        self.assertEqual(result.variables, ("?x", "?y", "?z"))
+        self.assertEqual(result.rows, (("alice", "bob", "carol"),))
+
+    def test_derived_triples_match_like_explicit(self):
+        model = query_model()
+        # alice likes bob 由规则 knows-likes 推出，应与显式事实一样命中
+        result = model.query("SELECT ?x ?y WHERE { ?x likes ?y }")
+        self.assertEqual(
+            result.rows,
+            (("alice", "bob"), ("bob", "carol")),
+        )
+        # 但 source_rule 仍只描述推理来源
+        self.assertEqual(model.source_rule("alice", "likes", "bob"), "knows-likes")
+        self.assertIsNone(model.source_rule("bob", "likes", "carol"))
+
+    def test_constant_subject_and_object(self):
+        model = query_model()
+        self.assertEqual(
+            model.query("SELECT ?y WHERE { alice knows ?y }").rows,
+            (("bob",),),
+        )
+        self.assertEqual(
+            model.query("SELECT ?y WHERE { ?y knows carol }").rows,
+            (("bob",),),
+        )
+        self.assertEqual(
+            model.query("SELECT * WHERE { alice knows carol }").rows,
+            (),
+        )
+
+    def test_same_variable_bound_equal_within_pattern(self):
+        model = query_model()
+        self.assertEqual(
+            model.query("SELECT ?x WHERE { ?x knows ?x }").rows, ()
+        )
+
+    def test_rows_deduped_and_sorted_by_projection(self):
+        model = query_model()
+        # 仅投影 ?y，?x 取值不同不产生重复行
+        result = model.query("SELECT ?y WHERE { ?x knows ?y }")
+        self.assertEqual(result.rows, (("bob",), ("carol",)))
+
+    def test_no_match_returns_empty_rows(self):
+        model = query_model()
+        result = model.query("SELECT ?x WHERE { ?x knows nobody }")
+        self.assertEqual(result.variables, ("?x",))
+        self.assertEqual(result.rows, ())
+
+    def test_ground_pattern_star_has_no_variables(self):
+        model = query_model()
+        hit = model.query("SELECT * WHERE { alice knows bob }")
+        self.assertEqual(hit.variables, ())
+        self.assertEqual(hit.rows, ((),))
+        miss = model.query("SELECT * WHERE { alice knows nobody }")
+        self.assertEqual(miss.rows, ())
+
+    def test_trailing_dot_and_mixed_whitespace(self):
+        model = query_model()
+        result = model.query(
+            "SELECT\t?x\nWHERE  {\n ?x knows ?y .\n}"
+        )
+        self.assertEqual(result.rows, (("alice",), ("bob",)))
+
+    def test_json_string_literal_decoded_and_exact(self):
+        doc = make_doc(
+            triples=[
+                {"subject": "alice", "predicate": "likes", "object": 'a"b  c'}
+            ]
+        )
+        model = parse(doc)
+        self.assertEqual(
+            model.query(r'SELECT ?s WHERE { ?s likes "a\"b  c" }').rows,
+            (("alice",),),
+        )
+        self.assertEqual(
+            model.query(r'SELECT ?s WHERE { ?s likes "a\"b c" }').rows,
+            (),
+        )
+
+    def test_unicode_variable_and_name(self):
+        doc = make_doc(
+            triples=[
+                {"subject": "张三", "predicate": "knows", "object": "李四"}
+            ]
+        )
+        model = OntologyEngine().parse(json.dumps(doc, ensure_ascii=False))
+        result = model.query("SELECT ?人1 WHERE { ?人1 knows ?_y }")
+        self.assertEqual(result.variables, ("?人1",))
+        self.assertEqual(result.rows, (("张三",),))
+
+    def test_pattern_order_only_affects_star_discovery(self):
+        model = query_model()
+        explicit_a = model.query(
+            "SELECT ?x ?y ?z WHERE { ?x knows ?y . ?y likes ?z }"
+        )
+        explicit_b = model.query(
+            "SELECT ?x ?y ?z WHERE { ?y likes ?z . ?x knows ?y }"
+        )
+        self.assertEqual(explicit_a.rows, explicit_b.rows)
+        star_a = model.query(
+            "SELECT * WHERE { ?x knows ?y . ?y likes ?z }"
+        )
+        star_b = model.query(
+            "SELECT * WHERE { ?y likes ?z . ?x knows ?y }"
+        )
+        self.assertEqual(star_a.variables, ("?x", "?y", "?z"))
+        self.assertEqual(star_b.variables, ("?y", "?z", "?x"))
+        bindings_a = {tuple(sorted(zip(star_a.variables, r))) for r in star_a.rows}
+        bindings_b = {tuple(sorted(zip(star_b.variables, r))) for r in star_b.rows}
+        self.assertEqual(bindings_a, bindings_b)
+
+    def test_repeated_execution_identical(self):
+        model = query_model()
+        text = "SELECT * WHERE { ?x knows ?y . ?y likes ?z }"
+        first = model.query(text)
+        for _ in range(3):
+            again = model.query(text)
+            self.assertEqual(again, first)
+            self.assertIsNot(again.rows, first.rows)
+
+    def test_rows_are_immutable_tuples(self):
+        model = query_model()
+        result = model.query("SELECT ?x WHERE { ?x knows ?y }")
+        self.assertIsInstance(result.variables, tuple)
+        self.assertIsInstance(result.rows, tuple)
+        self.assertTrue(all(isinstance(row, tuple) for row in result.rows))
+        with self.assertRaises(TypeError):
+            result.rows[0] = ("x",)
+
+    def test_query_does_not_mutate_model(self):
+        model = query_model()
+        before = (model.explicit_triples, model.derived_triples, model.triples)
+        model.query("SELECT * WHERE { ?x knows ?y . ?y likes ?z }")
+        after = (model.explicit_triples, model.derived_triples, model.triples)
+        self.assertEqual(before, after)
+
+
+class QuerySyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def assertQueryError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(text)
+        message = str(ctx.exception)
+        self.assertTrue(
+            "字符位置" in message or "模式" in message,
+            f"错误消息缺少字符位置或模式序号: {message}",
+        )
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+
+    def test_lowercase_keywords_rejected(self):
+        self.assertQueryError("select ?x WHERE { ?x knows ?y }")
+        self.assertQueryError("SELECT ?x where { ?x knows ?y }")
+
+    def test_missing_keywords_and_braces(self):
+        self.assertQueryError("?x WHERE { ?x knows ?y }")
+        self.assertQueryError("SELECT WHERE { ?x knows ?y }")
+        self.assertQueryError("SELECT ?x { ?x knows ?y }")
+        self.assertQueryError("SELECT ?x WHERE  ?x knows ?y }")
+        self.assertQueryError("SELECT ?x WHERE { ?x knows ?y ")
+        self.assertQueryError("SELECT ?x WHERE { ?x knows ?y } }")
+        self.assertQueryError("")
+        self.assertQueryError("SELECT")
+
+    def test_duplicate_or_unknown_projection_variable(self):
+        self.assertQueryError(
+            "SELECT ?x ?x WHERE { ?x knows ?y }", "?x", "重复"
+        )
+        self.assertQueryError(
+            "SELECT ?z WHERE { ?x knows ?y }", "?z", "未"
+        )
+
+    def test_empty_pattern_body(self):
+        self.assertQueryError("SELECT * WHERE { }", "空")
+        self.assertQueryError("SELECT * WHERE {  }", "空")
+
+    def test_variable_predicate_rejected(self):
+        self.assertQueryError("SELECT * WHERE { ?x ?p ?y }", "谓语", "模式 0")
+
+    def test_unknown_statement_component(self):
+        self.assertQueryError("SELECT ?x WHERE { ?x knows ?y } EXTRA")
+        self.assertQueryError("SELECT * * WHERE { ?x knows ?y }")
+        self.assertQueryError("SELECT . ?x WHERE { ?x knows ?y }")
+
+    def test_pattern_arity_too_few_or_many(self):
+        self.assertQueryError("SELECT * WHERE { ?x knows }", "模式 0", "项数不足")
+        self.assertQueryError(
+            "SELECT * WHERE { ?x knows ?y likes ?z }", "项数过多"
+        )
+        self.assertQueryError(
+            "SELECT * WHERE { ?x knows ?y . knows ?y }", "模式 1", "项数不足"
+        )
+        self.assertQueryError(
+            "SELECT * WHERE { . ?x knows ?y }", "'.'"
+        )
+        self.assertQueryError(
+            "SELECT * WHERE { ?x knows ?y . . ?y knows ?z }", "'.'"
+        )
+
+    def test_lexical_errors(self):
+        self.assertQueryError("SELECT ? WHERE { ?x knows ?y }")
+        self.assertQueryError('SELECT * WHERE { ?x likes "unclosed }')
+        self.assertQueryError(r'SELECT * WHERE { ?x likes "bad\q" }')
+
+    def test_non_str_input(self):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(123)
+        self.assertIn("str", str(ctx.exception))
 
 
 if __name__ == "__main__":

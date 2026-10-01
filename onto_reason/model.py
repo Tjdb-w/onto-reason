@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Iterator, Optional, Tuple
 
+from .query import QueryResult, run_query
+
 
 class Triple(tuple):
     """一条三元组 (subject, predicate, object)，按字典序可比较。"""
@@ -121,3 +123,11 @@ class OntologyModel:
     def source_rule(self, subject: str, predicate: str, object_: str) -> Optional[object]:
         """返回推理出该三元组的规则 id；显式或未知三元组返回 None。"""
         return self._source.get(Triple(subject, predicate, object_))
+
+    def query(self, text: str) -> QueryResult:
+        """执行 SPARQL 风格基本图模式查询，在显式与推理三元组上匹配。
+
+        例如 SELECT ?x ?y WHERE { ?x knows ?y . ?y likes ?z }；
+        查询不修改模型，重复执行结果一致。词法或语法错误抛出 OntologyError。
+        """
+        return run_query(self, text)
