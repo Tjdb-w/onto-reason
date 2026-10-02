@@ -3079,5 +3079,493 @@ class ExplainDiagnosticTests(unittest.TestCase):
         self.assertEqual(before, after)
 
 
+class AskTests(unittest.TestCase):
+    """OntologyModel.ask：ASK WHERE { ... } 存在性查询的公开验收行为。"""
+
+    def assertAsk(self, model, text, expected):
+        result = model.ask(text)
+        # 返回值必须是真正的 bool（True/False），而非一般真值
+        self.assertIsInstance(result, bool)
+        self.assertIs(result, expected)
+        # ASK 与 SELECT * 的“是否存在解”严格等价，与投影去重无关
+        select_text = "SELECT * " + text[len("ASK "):]
+        select_has_rows = len(model.query(select_text).rows) > 0
+        self.assertIs(select_has_rows, expected)
+        return result
+
+    # ---------- 普通匹配与 True/False 结果 ----------
+
+    def test_plain_match_returns_true_and_false(self):
+        model = query_model()
+        self.assertAsk(model, "ASK WHERE { alice knows bob }", True)
+        self.assertAsk(model, "ASK WHERE { alice knows carol }", False)
+        self.assertAsk(model, "ASK WHERE { ?x knows ?y }", True)
+        self.assertAsk(model, "ASK WHERE { ?x knows nobody }", False)
+
+    def test_result_is_python_bool(self):
+        model = query_model()
+        self.assertIs(model.ask("ASK WHERE { alice knows bob }"), True)
+        self.assertIs(model.ask("ASK WHERE { alice knows nobody }"), False)
+
+    def test_constant_subject_object_join(self):
+        model = query_model()
+        self.assertAsk(model, "ASK WHERE { ?x knows carol }", True)
+        self.assertAsk(model, "ASK WHERE { carol knows ?x }", False)
+        # 两个模式的连接：变量 ?y 跨模式共享
+        self.assertAsk(
+            model, "ASK WHERE { ?x knows ?y . ?y likes ?z }", True
+        )
+        self.assertAsk(
+            model, "ASK WHERE { ?x knows ?y . ?y friendOf ?z }", False
+        )
+
+    def test_same_variable_must_bind_equal(self):
+        model = query_model()
+        self.assertAsk(model, "ASK WHERE { ?x knows ?x }", False)
+
+    # ---------- 推理后匹配 ----------
+
+    def test_match_on_derived_triple(self):
+        model = query_model()
+        # alice likes bob 由规则 knows-likes 推出
+        self.assertAsk(model, "ASK WHERE { alice likes bob }", True)
+        self.assertAsk(model, "ASK WHERE { ?x likes ?y }", True)
+        # ASK 不改变推理来源信息
+        self.assertEqual(
+            model.source_rule("alice", "likes", "bob"), "knows-likes"
+        )
+
+    def test_multi_hop_inferred_match(self):
+        model = query_model()
+        # friendOf 由两条 knows/likes 前提连接推出
+        self.assertAsk(model, "ASK WHERE { alice friendOf carol }", True)
+        self.assertAsk(model, "ASK WHERE { carol friendOf alice }", False)
+
+    # ---------- OPTIONAL ----------
+
+    def test_optional_with_and_without_match_is_true(self):
+        model = optional_model()
+        # bob 有 likes，块内扩展出解
+        self.assertAsk(
+            model, "ASK WHERE { ?x knows ?y . OPTIONAL { ?y likes ?z } }", True
+        )
+        # label 三元组不存在：无匹配时保留原解一次，ASK 仍为真
+        self.assertAsk(
+            model, "ASK WHERE { ?x knows ?y . OPTIONAL { ?y label ?z } }", True
+        )
+        # 固定到一个没有 email 的主语，同样保留原解
+        self.assertAsk(
+            model, "ASK WHERE { alice knows bob . OPTIONAL { bob email ?e } }",
+            True,
+        )
+
+    def test_optional_filter_bound_and_not_bound(self):
+        model = optional_model()
+        # 至少一个 ?y 有 likes：BOUND 为真
+        self.assertAsk(
+            model,
+            "ASK WHERE { ?x knows ?y . OPTIONAL { ?y likes ?z }"
+            " FILTER(BOUND(?z)) }",
+            True,
+        )
+        # dave 没有 likes：!BOUND 保留该解
+        self.assertAsk(
+            model,
+            "ASK WHERE { ?x knows ?y . OPTIONAL { ?y likes ?z }"
+            " FILTER(!BOUND(?z)) }",
+            True,
+        )
+        # 固定到 dave（无 likes）再要求 BOUND：所有解被过滤，结果为假
+        self.assertAsk(
+            model,
+            "ASK WHERE { carol knows dave . OPTIONAL { dave likes ?z }"
+            " FILTER(BOUND(?z)) }",
+            False,
+        )
+
+    def test_optional_unbound_comparison_is_false(self):
+        model = optional_model()
+        for op in ("=", "!="):
+            self.assertAsk(
+                model,
+                f"ASK WHERE {{ carol knows dave ."
+                f" OPTIONAL {{ dave likes ?z }} FILTER(?z {op} \"x\") }}",
+                False,
+            )
+
+    # ---------- FILTER ----------
+
+    def test_filter_variable_equality_and_inequality(self):
+        model = optional_model()
+        self.assertAsk(
+            model, "ASK WHERE { ?x knows ?y . FILTER(?x = ?y) }", False
+        )
+        self.assertAsk(
+            model, "ASK WHERE { ?x knows ?y . FILTER(?x != ?y) }", True
+        )
+
+    def test_filter_string_literal_comparisons(self):
+        model = optional_model()
+        self.assertAsk(
+            model,
+            'ASK WHERE { ?x knows ?y . FILTER(?y = "carol") }',
+            True,
+        )
+        self.assertAsk(
+            model,
+            'ASK WHERE { ?x knows ?y . FILTER(?y = "nobody") }',
+            False,
+        )
+        self.assertAsk(
+            model,
+            'ASK WHERE { ?x knows ?y . FILTER(?y != "carol") }',
+            True,
+        )
+        self.assertAsk(
+            model,
+            'ASK WHERE { ?x knows ?y . FILTER("a" = "a") }',
+            True,
+        )
+        self.assertAsk(
+            model,
+            'ASK WHERE { ?x knows ?y . FILTER("a" != "a") }',
+            False,
+        )
+
+    def test_multiple_filters_combined_with_logical_and(self):
+        model = optional_model()
+        self.assertAsk(
+            model,
+            "ASK WHERE { ?x knows ?y . FILTER(BOUND(?x)) FILTER(?x != ?y) }",
+            True,
+        )
+        self.assertAsk(
+            model,
+            'ASK WHERE { ?x knows ?y . FILTER(BOUND(?x))'
+            ' FILTER(?x = "alice") FILTER(?x = "bob") }',
+            False,
+        )
+
+    # ---------- UNION ----------
+
+    def test_union_any_branch_matches(self):
+        model = union_model()
+        self.assertAsk(
+            model,
+            "ASK WHERE { { ?s email ?o } UNION { ?s likes ?o } }",
+            True,
+        )
+
+    def test_union_all_branches_fail_is_false(self):
+        model = union_model()
+        self.assertAsk(
+            model,
+            "ASK WHERE { { ?s knows ?s } UNION { ?s likes ?s } }",
+            False,
+        )
+
+    def test_filter_after_union_runs_on_merged_solutions(self):
+        model = union_model()
+        # ?y = dave 只能来自 knows 分支
+        self.assertAsk(
+            model,
+            "ASK WHERE { { ?x knows ?y } UNION { ?x likes ?y }"
+            ' FILTER(?y = "dave") }',
+            True,
+        )
+        self.assertAsk(
+            model,
+            "ASK WHERE { { ?x knows ?y } UNION { ?x likes ?y }"
+            ' FILTER(?y = "nobody") }',
+            False,
+        )
+
+    def test_union_variable_bound_in_single_branch_counts(self):
+        model = union_model()
+        # ?e 只在 email 分支绑定，仍存在满足全部条件的最终解
+        self.assertAsk(
+            model,
+            "ASK WHERE { { ?s knows ?o } UNION { ?s email ?e } }",
+            True,
+        )
+        # 全部分支都无匹配时为假
+        self.assertAsk(
+            model,
+            "ASK WHERE { { nobody knows ?o } UNION { nobody likes ?o } }",
+            False,
+        )
+
+    # ---------- 属性路径与环状路径 ----------
+
+    def test_inverse_sequence_alternation_paths(self):
+        model = path_model()
+        self.assertAsk(model, "ASK WHERE { ?s ^edge b }", True)
+        self.assertAsk(model, "ASK WHERE { ?s ^edge zzz }", False)
+        self.assertAsk(model, "ASK WHERE { ?x ^other a }", True)
+        self.assertAsk(model, "ASK WHERE { a edge/edge c }", True)
+        self.assertAsk(model, "ASK WHERE { a edge/edge x }", False)
+        self.assertAsk(model, "ASK WHERE { a edge|other x }", True)
+        self.assertAsk(model, "ASK WHERE { x edge|other a }", False)
+        # 逆向路径同样命中推理事实（invOnly 全部为派生边）
+        self.assertAsk(model, "ASK WHERE { ?s ^invOnly a }", True)
+
+    def test_quantified_paths(self):
+        model = path_model()
+        self.assertAsk(model, "ASK WHERE { ?s edge? ?s }", True)
+        self.assertAsk(model, "ASK WHERE { a edge+ b }", True)
+        self.assertAsk(model, "ASK WHERE { x edge+ ?o }", False)
+        self.assertAsk(model, "ASK WHERE { a edge* a }", True)
+        # a 经 edge 可到 b/c/d/x（a→x 由 other-to-edge 推出），不到 B/iso
+        self.assertAsk(model, "ASK WHERE { a edge* x }", True)
+        self.assertAsk(model, "ASK WHERE { a edge+ B }", False)
+        self.assertAsk(model, "ASK WHERE { a edge* iso }", False)
+
+    def test_paths_inside_optional_and_union(self):
+        model = path_model()
+        # x 经 ^other 取得，OPTIONAL 的 edge+ 无匹配仍保留原解
+        self.assertAsk(
+            model,
+            "ASK WHERE { ?x ^other a . OPTIONAL { ?x edge+ ?y } }",
+            True,
+        )
+        self.assertAsk(
+            model,
+            "ASK WHERE { { a edge+ ?o } UNION { a other ?o } }",
+            True,
+        )
+
+    def test_filter_with_path_bound_variable(self):
+        model = path_model()
+        self.assertAsk(
+            model, 'ASK WHERE { a edge* ?o . FILTER(?o = "c") }', True
+        )
+        self.assertAsk(
+            model, 'ASK WHERE { a edge* ?o . FILTER(?o = "zzz") }', False
+        )
+
+    def test_cyclic_path_positive_closure_self_reach(self):
+        model = path_model()
+        # 环 b→c→d→b 上节点正数步回到自身
+        self.assertAsk(model, "ASK WHERE { ?x edge+ ?x }", True)
+        self.assertAsk(model, "ASK WHERE { a edge+ a }", False)
+
+    def test_cyclic_path_query_repeatable_and_terminates(self):
+        model = path_model()
+        text = "ASK WHERE { ?s edge* ?o }"
+        first = model.ask(text)
+        self.assertIs(first, True)
+        for _ in range(5):
+            again = model.ask(text)
+            self.assertIs(again, first)
+
+    def test_dedup_indifference_single_vs_many_solutions(self):
+        model = path_model()
+        # SELECT 仅一行与多行的两种查询，ASK 都只报告存在性
+        single = "ASK WHERE { a edge/edge c }"
+        many = "ASK WHERE { ?s edge* ?o }"
+        self.assertEqual(len(model.query("SELECT * WHERE { a edge/edge c }").rows), 1)
+        self.assertGreater(
+            len(model.query("SELECT * WHERE { ?s edge* ?o }").rows), 1
+        )
+        self.assertIs(model.ask(single), True)
+        self.assertIs(model.ask(many), True)
+
+    # ---------- 一致性、重复调用与不修改模型 ----------
+
+    def test_repeated_ask_identical(self):
+        model = query_model()
+        for text, expected in (
+            ("ASK WHERE { ?x knows ?y }", True),
+            ("ASK WHERE { ?x knows nobody }", False),
+            ("ASK WHERE { alice friendOf carol }", True),
+        ):
+            first = model.ask(text)
+            for _ in range(3):
+                self.assertIs(model.ask(text), first)
+                self.assertEqual(model.ask(text), expected)
+
+    def test_ask_does_not_mutate_model(self):
+        model = path_model()
+        before = (
+            model.explicit_triples,
+            model.derived_triples,
+            model.triples,
+            model.declared_properties,
+        )
+        proofs_before = model.explain("a", "edge", "x")
+        texts = (
+            "ASK WHERE { ?s edge* ?o }",
+            "ASK WHERE { ?x ^other a . OPTIONAL { ?x edge+ ?y } }",
+            "ASK WHERE { { a edge+ ?o } UNION { a other ?o } }",
+            "ASK WHERE { ?x edge ?zzz }",
+        )
+        for text in texts:
+            model.ask(text)
+        self.assertEqual(
+            (
+                model.explicit_triples,
+                model.derived_triples,
+                model.triples,
+                model.declared_properties,
+            ),
+            before,
+        )
+        # 证明、来源与 SELECT 结果均不受影响
+        self.assertEqual(model.explain("a", "edge", "x"), proofs_before)
+        self.assertEqual(model.source_rule("a", "edge", "x"), "other-to-edge")
+
+    def test_ask_does_not_change_select_results(self):
+        model = union_model()
+        query = (
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION { ?s likes ?o } }"
+        )
+        before = model.query(query)
+        model.ask(
+            "ASK WHERE { { ?s knows ?o } UNION { ?s likes ?o } }"
+        )
+        model.ask(
+            "ASK WHERE { ?x knows ?y . OPTIONAL { ?y email ?e }"
+            " FILTER(!BOUND(?e)) }"
+        )
+        self.assertEqual(model.query(query), before)
+
+
+class AskSyntaxErrorTests(unittest.TestCase):
+    """ASK 入口的词法/语法/不支持形式错误边界。"""
+
+    def setUp(self):
+        self.model = union_model()
+        self.path_model = path_model()
+
+    def assertAskError(self, model, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            model.ask(text)
+        message = str(ctx.exception)
+        self.assertTrue(
+            "字符位置" in message
+            or "模式" in message
+            or "分支" in message
+            or "str" in message,
+            f"错误消息缺少字符位置、模式序号或收到类型: {message}",
+        )
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+        return message
+
+    def test_non_str_input_reports_received_type(self):
+        for bad, type_name in ((123, "int"), (None, "NoneType"), (b"ASK", "bytes")):
+            with self.assertRaises(OntologyError) as ctx:
+                self.model.ask(bad)
+            message = str(ctx.exception)
+            self.assertIn("str", message)
+            self.assertIn(type_name, message)
+
+    def test_empty_or_blank_query_rejected(self):
+        self.assertAskError(self.model, "")
+        self.assertAskError(self.model, "   ")
+        self.assertAskError(self.model, "\n\t ")
+
+    def test_lowercase_keywords_not_recognized(self):
+        self.assertAskError(self.model, "ask WHERE { ?x knows ?y }")
+        self.assertAskError(self.model, "ASK where { ?x knows ?y }")
+
+    def test_select_and_projection_forms_rejected(self):
+        self.assertAskError(
+            self.model, "SELECT ?x WHERE { ?x knows ?y }"
+        )
+        self.assertAskError(self.model, "ASK ?x WHERE { ?x knows ?y }")
+        self.assertAskError(self.model, "ASK * WHERE { ?x knows ?y }")
+        self.assertAskError(
+            self.model, "ASK WHERE { ?x knows ?y } ?x"
+        )
+
+    def test_missing_keywords_braces_and_trailing_forms(self):
+        self.assertAskError(self.model, "ASK")
+        self.assertAskError(self.model, "ASK WHERE")
+        self.assertAskError(self.model, "ASK { ?x knows ?y }")
+        self.assertAskError(self.model, "ASK WHERE { ?x knows ?y")
+        self.assertAskError(
+            self.model, "ASK WHERE { ?x knows ?y } EXTRA", "EXTRA"
+        )
+        self.assertAskError(self.model, "ASK WHERE { }", "空")
+        self.assertAskError(self.model, "ASK WHERE {  }", "空")
+        # WHERE 与模式组之间不允许插入其它形式
+        self.assertAskError(self.model, "ASK WHERE SELECT { ?x knows ?y }")
+
+    def test_ask_body_uses_select_error_rules(self):
+        # 变量谓语、项数错误等沿用 SELECT 的模式序号报错
+        self.assertAskError(
+            self.model, "ASK WHERE { ?x ?p ?y }", "谓语", "模式 0"
+        )
+        self.assertAskError(
+            self.model, "ASK WHERE { ?x knows }", "模式 0", "项数不足"
+        )
+        self.assertAskError(
+            self.model,
+            "ASK WHERE { ?x knows ?y likes ?z }",
+            "项数过多",
+        )
+
+    def test_undeclared_property_rejected(self):
+        self.assertAskError(
+            self.model, "ASK WHERE { ?x nope ?y }", "nope", "未声明"
+        )
+        self.assertAskError(
+            self.path_model,
+            "ASK WHERE { a edge/nope ?o }",
+            "nope",
+            "未声明",
+        )
+        self.assertAskError(
+            self.path_model, "ASK WHERE { a ^nope ?o }", "nope", "未声明"
+        )
+        self.assertAskError(
+            self.path_model,
+            "ASK WHERE { a (edge|nope) ?o }",
+            "nope",
+            "未声明",
+        )
+
+    def test_unsupported_filter_and_clause_forms_rejected(self):
+        self.assertAskError(
+            self.model,
+            "ASK WHERE { ?x knows ?y . FILTER(?x > ?y) }",
+            "FILTER",
+        )
+        self.assertAskError(
+            self.model,
+            "ASK WHERE { ?x knows ?y . FILTER(?x) }",
+            "FILTER",
+        )
+        self.assertAskError(
+            self.model,
+            "ASK WHERE { ?x knows ?y ."
+            " OPTIONAL { OPTIONAL { ?x knows ?y } } }",
+            "OPTIONAL",
+        )
+        # 相邻花括号组缺少 UNION
+        self.assertAskError(
+            self.model,
+            "ASK WHERE { { ?x knows ?y } { ?x likes ?o } }",
+            "UNION",
+        )
+        # UNION 缺少第二个分支
+        self.assertAskError(
+            self.model, "ASK WHERE { { ?x knows ?y } UNION }", "'{'"
+        )
+        # 空分支
+        self.assertAskError(
+            self.model,
+            "ASK WHERE { { } UNION { ?x likes ?o } }",
+            "分支 1",
+        )
+
+    def test_lexical_errors_reported_with_position(self):
+        self.assertAskError(
+            self.model, "ASK WHERE { ?x likes \"unclosed }"
+        )
+        self.assertAskError(self.model, "ASK WHERE { ? WHERE { x }")
+
+
 if __name__ == "__main__":
     unittest.main()

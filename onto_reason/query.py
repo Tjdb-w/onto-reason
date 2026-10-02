@@ -1,9 +1,10 @@
-"""SPARQL 风格基本图模式（BGP）查询，支持 OPTIONAL 左连接、FILTER 筛选、UNION 并集
-与谓语位置的属性路径。
+"""SPARQL 风格基本图模式（BGP）查询，支持 SELECT 与 ASK 两种入口、
+OPTIONAL 左连接、FILTER 筛选、UNION 并集与谓语位置的属性路径。
 
 支持的语法（关键字只接受大写）：
 
     SELECT (变量... | *) WHERE { 模式 ('.' 模式)* '.'? }
+    ASK WHERE { 模式 ('.' 模式)* '.'? }
     模式 := 三元组模式
           | OPTIONAL { 三元组模式 ('.' 三元组模式)* '.'? }
           | FILTER ( 表达式 )
@@ -42,6 +43,11 @@
   UNION 之后的 FILTER 在所有分支合并完成后执行，可引用任一分支的变量。
 - '*' 按模式（含 OPTIONAL 块与 UNION 分支内模式）从左到右首次出现的顺序
   投影全部变量；投影变量未绑定时结果行中以 None 占位。
+- ASK 不做投影：只接受 'ASK WHERE' 后接一个非空模式组，不接受 SELECT、
+  变量列表、星号或 WHERE 之外的后缀；模式体语法（三元组模式、OPTIONAL、
+  FILTER、UNION、属性路径）与 SELECT 完全一致。求值在相同的显式 + 推理
+  三元组并集上进行，至少存在一个满足全部条件的最终绑定时返回 True，
+  否则返回 False；合法查询无匹配确定返回 False，不视为错误。
 
 查询在 OntologyModel.triples（显式 + 推理三元组）上做嵌套循环连接匹配，
 同一变量跨模式绑定同一字符串，一条事实可被多个模式复用。
@@ -449,7 +455,11 @@ def _pending_item_pos(item) -> int:
 
 
 class _Parser:
-    """把 token 流编译为 (投影变量名列表, 模式子句列表, 是否星号投影)。
+    """把 token 流编译为查询结构。
+
+    SELECT 入口 parse() 返回 (投影变量名列表, 模式子句列表, 是否星号投影)；
+    ASK 入口 parse_ask() 只返回模式子句列表（ASK 不做投影）。
+    两种入口共用同一套 WHERE 模式组词法与语法。
 
     模式子句为三元组：
     - (_CLAUSE_BGP, patterns, None)
@@ -571,6 +581,21 @@ class _Parser:
     def parse(self) -> Tuple[Tuple[str, ...], List[tuple], bool]:
         self._expect_keyword("SELECT")
         projection, star = self._parse_projection()
+        clauses = self._parse_where_group()
+        self._validate_projection(projection, clauses)
+        return tuple(name for name, _ in projection), clauses, star
+
+    def parse_ask(self) -> List[tuple]:
+        """解析 ASK WHERE { ... }：无投影，只返回模式子句列表。"""
+        self._expect_keyword("ASK")
+        return self._parse_where_group()
+
+    def _parse_where_group(self) -> List[tuple]:
+        """消费 WHERE 与紧随的非空花括号模式组，拒绝组后的任何多余成分。
+
+        SELECT 与 ASK 共用：模式体为空、花括号缺失或组后存在多余 token 时
+        按与历史 SELECT 完全相同的消息与位置报错。
+        """
         self._expect_keyword("WHERE")
         if self._eof() or self._peek().kind != _TOK_LBRACE:
             raise self._error("WHERE 后缺少左花括号 '{'", self._here_pos())
@@ -580,8 +605,7 @@ class _Parser:
         if not self._eof():
             tok = self._peek()
             raise self._error(f"右花括号后存在未知语句成分 {tok.value!r}", tok.pos)
-        self._validate_projection(projection, clauses)
-        return tuple(name for name, _ in projection), clauses, star
+        return clauses
 
     def _parse_projection(self) -> Tuple[List[Tuple[str, int]], bool]:
         if self._eof():
@@ -1239,6 +1263,16 @@ def _compile_query(text, properties: frozenset) -> Tuple[Tuple[str, ...], List[t
     return _Parser(text, lexer, frozenset(properties)).parse()
 
 
+def _compile_ask(text, properties: frozenset) -> List[tuple]:
+    """编译 ASK 查询：与 SELECT 相同的输入类型与空串校验，只返回模式子句。"""
+    if not isinstance(text, str):
+        raise OntologyError(
+            f"查询文本必须是 str 类型，收到 {type(text).__name__}"
+        )
+    lexer = _Lexer(text)
+    return _Parser(text, lexer, frozenset(properties)).parse_ask()
+
+
 def _all_patterns(clauses) -> List[Tuple[Any, Any, Any]]:
     """按子句顺序取出全部三元组模式（含 OPTIONAL 块与 UNION 分支内模式）。"""
     patterns: List[Tuple[Any, Any, Any]] = []
@@ -1400,15 +1434,12 @@ def _eval_filter(expr: tuple, binding: dict) -> bool:
     return equal if kind == _EXPR_EQ else not equal
 
 
-def run_query(model, text) -> QueryResult:
-    """在 model.triples 上执行查询，返回去重并按字典序排序后的 QueryResult。"""
-    properties = frozenset(getattr(model, "declared_properties", ()))
-    projection, clauses, star = _compile_query(text, properties)
-    if star:
-        projection = _star_variables(clauses)
+def _evaluate_clauses(matcher: _PathMatcher, clauses) -> List[dict]:
+    """在 matcher 的事实上按序求值全部模式子句，返回最终绑定列表。
 
-    facts = model.triples
-    matcher = _PathMatcher(facts)
+    SELECT 与 ASK 共用同一套连接语义：BGP 内连接、OPTIONAL 左连接、
+    UNION 各分支从当前绑定独立匹配后合并、FILTER 按逻辑与作用于此前全部解。
+    """
     bindings: List[dict] = [{}]
     for kind, patterns, expr in clauses:
         if kind == _CLAUSE_FILTER:
@@ -1435,6 +1466,19 @@ def run_query(model, text) -> QueryResult:
             bindings = _match_patterns(matcher, bindings, patterns)
         if not bindings:
             break
+    return bindings
+
+
+def run_query(model, text) -> QueryResult:
+    """在 model.triples 上执行查询，返回去重并按字典序排序后的 QueryResult。"""
+    properties = frozenset(getattr(model, "declared_properties", ()))
+    projection, clauses, star = _compile_query(text, properties)
+    if star:
+        projection = _star_variables(clauses)
+
+    facts = model.triples
+    matcher = _PathMatcher(facts)
+    bindings = _evaluate_clauses(matcher, clauses)
 
     rows = {tuple(binding.get(name) for name in projection) for binding in bindings}
     # None（未绑定）排在所有字符串之前，保证混合取值时字典序排序稳定。
@@ -1445,3 +1489,17 @@ def run_query(model, text) -> QueryResult:
         )
     )
     return QueryResult(projection, ordered)
+
+
+def run_ask(model, text) -> bool:
+    """在 model.triples 上执行 ASK 查询：至少存在一个最终绑定即返回 True。
+
+    模式体与 SELECT 完全同构（三元组模式、OPTIONAL、FILTER、UNION、属性
+    路径）；OPTIONAL 无匹配仍保留原解，因此含未绑定块内变量的解同样使
+    ASK 为真。合法查询无匹配时返回 False，不做投影也不去重枚举。
+    """
+    properties = frozenset(getattr(model, "declared_properties", ()))
+    clauses = _compile_ask(text, properties)
+    matcher = _PathMatcher(model.triples)
+    bindings = _evaluate_clauses(matcher, clauses)
+    return bool(bindings)

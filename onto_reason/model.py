@@ -10,7 +10,7 @@ import itertools
 from typing import Iterator, Optional, Tuple
 
 from .errors import OntologyError
-from .query import QueryResult, run_query
+from .query import QueryResult, run_ask, run_query
 
 _VARIABLE_PREFIX = "?"
 
@@ -202,6 +202,8 @@ class OntologyModel:
     - derived_triples：推理结论，同样按字典序排列，每条带来源规则 id。
     - entails(s, p, o)：判断单条三元组是否被蕴含（显式或推理得出）。
     - explain(s, p, o)：给出该三元组的全部最短完整证明（Proof 元组）。
+    - query(text)：执行 SELECT 查询，返回 QueryResult。
+    - ask(text)：执行 ASK WHERE { ... } 存在性查询，返回 bool。
     - declared_properties：本体中已声明的属性名（查询谓语/属性路径据此校验）。
     所有读取接口均返回新对象，不改变模型内部数据。
     """
@@ -376,3 +378,22 @@ class OntologyModel:
         查询不修改模型，重复执行结果一致。词法或语法错误抛出 OntologyError。
         """
         return run_query(self, text)
+
+    def ask(self, text: str) -> bool:
+        """执行 SPARQL 风格 ASK WHERE { ... } 存在性查询，返回布尔值。
+
+        只接受 'ASK WHERE' 后接一个非空模式组，不做投影，也不接受 SELECT、
+        变量列表、星号或 WHERE 之外的后缀；关键字按 SELECT 入口相同的大写
+        规则识别（小写 ask/where 不是关键字）。模式体与 SELECT 完全同构：
+        普通三元组模式、OPTIONAL { ... }（无匹配时保留原解一次且块内变量
+        未绑定，该解仍计为存在）、FILTER ( 表达式 )（BOUND/!BOUND 与
+        =/!= 比较，未绑定变量上的等值/不等值为假，多个 FILTER 逻辑与）、
+        { ... } UNION { ... }（各分支从当前解独立匹配后合并，UNION 后的
+        FILTER 在合并结果上执行）以及谓语位置属性路径（^p、a/b、a|b、
+        p?、p*、p+，环状数据上有限结束，属性名必须已声明）。
+        查询在显式 + 推理三元组并集上求值，至少有一个满足全部条件的最终
+        绑定时返回 True，合法查询无匹配确定返回 False。查询不修改模型，
+        重复调用结果一致。输入不是字符串、查询为空、词法或语法非法、出现
+        不支持的形式或属性路径含未声明属性时抛出 OntologyError。
+        """
+        return run_ask(self, text)
