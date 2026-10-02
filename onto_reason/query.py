@@ -5,6 +5,8 @@
 
     SELECT (变量... | *) WHERE { 模式 ('.' 模式)* '.'? }
     ASK WHERE { 模式 ('.' 模式)* '.'? }
+    CONSTRUCT { 三元组模板 ('.' 三元组模板)* '.'? }
+              WHERE { 模式 ('.' 模式)* '.'? }
     模式 := 三元组模式
           | OPTIONAL { 三元组模式 ('.' 三元组模式)* '.'? }
           | FILTER ( 表达式 )
@@ -46,6 +48,12 @@
 - ASK 与 SELECT 共用同一 WHERE 模式体语法与求值语义，但不做投影：
   不接受 SELECT、变量列表或 '*'，WHERE 花括号之后也不允许任何后缀成分；
   至少存在一个满足全部条件的最终绑定时返回 True，否则返回 False。
+- CONSTRUCT 的 WHERE 模式体与 SELECT 完全同语法、同语义；其模板组只允许
+  一个或多个固定三项的三元组模板，模板之间用点分隔、末尾点可省略，
+  主语/宾语为变量或常量，谓语只能是已声明常量属性名，不接受变量谓语、
+  属性路径、OPTIONAL、FILTER 或 UNION，模板组不得为空。对每个最终绑定
+  逐项实例化模板：主语或宾语变量未绑定时跳过该模板，其余模板继续生成；
+  结果按三元组字典序去重排序，不写回模型，合法查询无匹配时返回空元组。
 
 查询在 OntologyModel.triples（显式 + 推理三元组）上做嵌套循环连接匹配，
 同一变量跨模式绑定同一字符串，一条事实可被多个模式复用。
@@ -604,6 +612,186 @@ class _Parser:
             tok = self._peek()
             raise self._error(f"右花括号后存在未知语句成分 {tok.value!r}", tok.pos)
         return clauses
+
+    def parse_construct(self) -> Tuple[List[tuple], List[tuple]]:
+        """解析 CONSTRUCT { 模板 } WHERE { 模式体 }。
+
+        返回 (模板列表, WHERE 子句列表)。模板由一个或多个固定三项的
+        三元组模板组成：主语、宾语为变量或常量，谓语只能是已声明的
+        常量属性名，不接受变量谓语、属性路径、OPTIONAL、FILTER 或
+        UNION；模板之间用点分隔，末尾点可省略。模板不得为空。
+        """
+        self._expect_keyword("CONSTRUCT")
+        if self._eof() or self._peek().kind != _TOK_LBRACE:
+            raise self._error("CONSTRUCT 后缺少左花括号 '{'", self._here_pos())
+        self._advance()
+        templates = self._parse_construct_templates()
+        self._expect_keyword("WHERE")
+        if self._eof() or self._peek().kind != _TOK_LBRACE:
+            raise self._error("WHERE 后缺少左花括号 '{'", self._here_pos())
+        self._advance()
+        clauses = self._parse_group_body(optional=False)
+        # _parse_group_body 已消费 WHERE 的右花括号
+        if not self._eof():
+            tok = self._peek()
+            raise self._error(f"右花括号后存在未知语句成分 {tok.value!r}", tok.pos)
+        return templates, clauses
+
+    def _parse_construct_templates(self) -> List[tuple]:
+        """解析 CONSTRUCT 之后的模板花括号组（已消费左花括号，消费右花括号）。
+
+        模板槽位沿用普通词法：主语/宾语接受变量、名称或 JSON 字符串；
+        谓语只接受一个恰好为已声明属性的 NAME/STRING，变量、路径运算符
+        以及 OPTIONAL/FILTER/UNION/嵌套花括号一律按非法拒绝。模板序号在
+        本组内从 0 连续编号，与 WHERE 模式序号相互独立。
+        """
+        templates: List[tuple] = []
+        pending: List[Any] = []
+        index = 0
+        prev_dot = False
+        lbrace_pos = self._last.pos
+
+        def finish_template() -> None:
+            nonlocal index
+            if len(pending) != 3:
+                pos = pending[-1][2] if pending else lbrace_pos
+                raise OntologyError(
+                    f"CONSTRUCT 模板 {index} 项数不足："
+                    f"需要主语、谓语、宾语三项（字符位置 {pos}）"
+                )
+            s, p, o = pending
+            if p[0] == _VAR:
+                raise OntologyError(
+                    f"CONSTRUCT 模板 {index} 的谓语不能是变量 {p[1]}"
+                    f"（字符位置 {p[2]}）"
+                )
+            if p[1] not in self._properties:
+                raise OntologyError(
+                    f"CONSTRUCT 模板 {index} 的谓语引用了未声明的属性"
+                    f" {p[1]!r}（字符位置 {p[2]}）"
+                )
+            templates.append((s, p, o))
+            pending.clear()
+            index += 1
+
+        while True:
+            if self._eof():
+                raise self._error("CONSTRUCT 模板缺少右花括号 '}'", len(self._text))
+            tok = self._peek()
+
+            if tok.kind == _TOK_RBRACE:
+                if pending:
+                    finish_template()
+                self._advance()
+                break
+
+            if tok.kind == _TOK_DOT:
+                if pending:
+                    finish_template()
+                elif prev_dot or not templates:
+                    raise self._error(
+                        "点号 '.' 只能出现在一条完整三元组模板之后",
+                        tok.pos,
+                    )
+                prev_dot = True
+                self._advance()
+                continue
+
+            # 模板组边界（组首或点号之后）上的查询结构一律不允许进入模板
+            if not pending:
+                if tok.kind == _TOK_LBRACE:
+                    raise self._error(
+                        "CONSTRUCT 模板内不得嵌套花括号组（模板只允许固定三项的"
+                        "三元组模板）",
+                        tok.pos,
+                    )
+                if (
+                    tok.kind == _TOK_NAME
+                    and tok.value == "OPTIONAL"
+                    and self._next_is(_TOK_LBRACE)
+                ):
+                    raise self._error(
+                        "CONSTRUCT 模板内不允许使用 OPTIONAL",
+                        tok.pos,
+                    )
+                if (
+                    tok.kind == _TOK_NAME
+                    and tok.value == "FILTER"
+                    and self._next_is(_TOK_LPAREN)
+                ):
+                    raise self._error(
+                        "CONSTRUCT 模板内不允许使用 FILTER",
+                        tok.pos,
+                    )
+                if tok.kind == _TOK_NAME and tok.value == "UNION":
+                    raise self._error(
+                        "CONSTRUCT 模板内不允许使用 UNION（模板只允许固定三项的"
+                        "三元组模板）",
+                        tok.pos,
+                    )
+
+            if len(pending) == 3:
+                if tok.kind == _TOK_NAME and tok.value == "UNION":
+                    raise self._error(
+                        "CONSTRUCT 模板内不允许使用 UNION（模板只允许固定三项的"
+                        "三元组模板，模板之间用 '.' 分隔）",
+                        tok.pos,
+                    )
+                raise self._error(
+                    f"CONSTRUCT 模板 {index} 项数过多：模板之间需要用 '.' 分隔",
+                    tok.pos,
+                )
+            if len(pending) == 1:
+                # 谓语槽：只允许单个已声明常量属性（NAME 或解码后同名的
+                # STRING），绝不切换到路径词法模式，因此属性路径的各种写法
+                # 要么留在本名称内（名称含路径字符且未声明 -> 未声明属性），
+                # 要么以下一个运算符 token（如独立的 '*'）的形式在此被拒。
+                if tok.kind == _TOK_VAR:
+                    pending.append((_VAR, tok.value, tok.pos))
+                    self._advance()
+                elif tok.kind in (_TOK_NAME, _TOK_STRING):
+                    pending.append((_LIT, tok.value, tok.pos))
+                    self._advance()
+                    # 普通词法下 '*' 是独立 token：谓语名称后紧跟（允许隔着
+                    # 空白）'*' 只能是 p* 路径量词写法。
+                    if not self._eof() and self._peek().kind == _TOK_STAR:
+                        star = self._peek()
+                        raise self._error(
+                            f"CONSTRUCT 模板 {index} 的谓语不接受属性路径："
+                            f"谓语只能是已声明的常量属性名（字符位置 {star.pos}）",
+                            star.pos,
+                        )
+                elif tok.kind == _TOK_STAR:
+                    raise self._error(
+                        f"CONSTRUCT 模板 {index} 的谓语不接受属性路径："
+                        f"谓语只能是已声明的常量属性名（不支持 '*' 量词）",
+                        tok.pos,
+                    )
+                else:
+                    raise self._error(
+                        f"CONSTRUCT 模板 {index} 的谓语只能是已声明的常量属性名，"
+                        f"遇到未知语句成分 {tok.value!r}",
+                        tok.pos,
+                    )
+            elif tok.kind == _TOK_VAR:
+                pending.append((_VAR, tok.value, tok.pos))
+                self._advance()
+            elif tok.kind in (_TOK_NAME, _TOK_STRING):
+                pending.append((_LIT, tok.value, tok.pos))
+                self._advance()
+            else:
+                raise self._error(
+                    f"CONSTRUCT 模板 {index} 中存在未知语句成分 {tok.value!r}",
+                    tok.pos,
+                )
+            prev_dot = False
+
+        if not templates:
+            raise OntologyError(
+                f"CONSTRUCT 花括号内的模板为空：至少需要一条三元组模板"
+                f"（字符位置 {lbrace_pos}）"
+            )
+        return templates
 
     def _parse_projection(self) -> Tuple[List[Tuple[str, int]], bool]:
         if self._eof():
@@ -1270,6 +1458,15 @@ def _compile_ask(text, properties: frozenset) -> List[tuple]:
     return _Parser(text, lexer, frozenset(properties)).parse_ask()
 
 
+def _compile_construct(text, properties: frozenset) -> Tuple[List[tuple], List[tuple]]:
+    if not isinstance(text, str):
+        raise OntologyError(
+            f"查询文本必须是 str 类型，收到 {type(text).__name__}"
+        )
+    lexer = _Lexer(text)
+    return _Parser(text, lexer, frozenset(properties)).parse_construct()
+
+
 def _all_patterns(clauses) -> List[Tuple[Any, Any, Any]]:
     """按子句顺序取出全部三元组模式（含 OPTIONAL 块与 UNION 分支内模式）。"""
     patterns: List[Tuple[Any, Any, Any]] = []
@@ -1493,3 +1690,33 @@ def run_ask(model, text) -> bool:
     clauses = _compile_ask(text, properties)
     matcher = _PathMatcher(model.triples)
     return bool(_eval_clauses(matcher, clauses))
+
+
+def run_construct(model, text):
+    """在 model.triples 上执行 CONSTRUCT 查询，返回去重并按字典序排序的三元组。
+
+    对每个通过 WHERE 全部条件的最终绑定逐项实例化模板：主语或宾语变量在
+    该绑定中未绑定时跳过这一条模板，其余模板照常生成。生成结果不写回
+    model，也不参与任何后续查询或解释；同一模型重复执行结果一致。
+    """
+    from .model import Triple
+
+    properties = frozenset(getattr(model, "declared_properties", ()))
+    templates, clauses = _compile_construct(text, properties)
+    matcher = _PathMatcher(model.triples)
+    bindings = _eval_clauses(matcher, clauses)
+
+    produced = set()
+    for binding in bindings:
+        for s, p, o in templates:
+            # 主语或宾语变量在该绑定中未绑定：跳过此模板，不影响其他模板。
+            if s[0] == _VAR and s[1] not in binding:
+                continue
+            if o[0] == _VAR and o[1] not in binding:
+                continue
+            subject = binding[s[1]] if s[0] == _VAR else s[1]
+            object_ = binding[o[1]] if o[0] == _VAR else o[1]
+            # 谓语在解析阶段已固定为已声明常量（p == (_LIT, 属性名, 位置)）。
+            produced.add(Triple(subject, p[1], object_))
+    # 所有进入集合的三元组均由字符串构成，直接按三元组字典序排列。
+    return tuple(sorted(produced))

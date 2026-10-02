@@ -3287,5 +3287,368 @@ class AskSyntaxErrorTests(unittest.TestCase):
         self.assertIs(self.model.ask("ASK WHERE { ?x knows nobody }"), False)
 
 
+class ConstructQueryTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def test_basic_construct_instantiates_templates_per_binding(self):
+        result = self.model.construct(
+            "CONSTRUCT { ?x likes ?y } WHERE { ?x knows ?y }"
+        )
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+
+    def test_construct_matches_where_over_explicit_and_derived_union(self):
+        # friendOf 边全部由规则推理得出，WHERE 必须在并集上命中
+        result = self.model.construct(
+            "CONSTRUCT { ?x friendOf ?z } WHERE { ?x friendOf ?z }"
+        )
+        self.assertEqual(result, (Triple("alice", "friendOf", "carol"),))
+
+    def test_multiple_templates_each_instantiated_per_binding(self):
+        result = self.model.construct(
+            "CONSTRUCT { ?x friendOf ?y . alice knows ?y }"
+            " WHERE { ?x knows ?y }"
+        )
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "bob"),
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "knows", "carol"),
+                Triple("bob", "friendOf", "carol"),
+            ),
+        )
+
+    def test_constant_subject_object_in_templates(self):
+        result = self.model.construct(
+            "CONSTRUCT { alice likes bob } WHERE { alice knows bob }"
+        )
+        self.assertEqual(result, (Triple("alice", "likes", "bob"),))
+
+    def test_trailing_dot_in_template_group_is_optional(self):
+        result = self.model.construct(
+            "CONSTRUCT { ?x likes ?y . } WHERE { ?x knows ?y }"
+        )
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+
+    def test_unbound_optional_variable_skips_template_but_others_continue(self):
+        # bob knows carol 但没有 friendOf 出边：第一条模板因 ?z 未绑定
+        # 被跳过，第二条模板照常生成；alice 的两条模板都生成。
+        result = self.model.construct(
+            "CONSTRUCT { ?x friendOf ?z . ?x knows ?y }"
+            " WHERE { ?x knows ?y . OPTIONAL { ?x friendOf ?z } }"
+        )
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("alice", "knows", "bob"),
+                Triple("bob", "knows", "carol"),
+            ),
+        )
+
+    def test_never_bound_template_variable_produces_nothing(self):
+        # ?z 不出现在任何 WHERE 模式中，每条绑定都未绑定，模板整体跳过
+        result = self.model.construct(
+            "CONSTRUCT { ?x likes ?z } WHERE { ?x knows ?y }"
+        )
+        self.assertEqual(result, ())
+
+    def test_results_deduped_across_bindings_and_templates(self):
+        # UNION 两个分支分别给出 knows 与 likes 的相同节点对，结果去重
+        result = self.model.construct(
+            "CONSTRUCT { ?x knows ?y }"
+            " WHERE { { ?x knows ?y } UNION { ?x likes ?y } }"
+        )
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "knows", "bob"),
+                Triple("bob", "knows", "carol"),
+            ),
+        )
+
+    def test_results_sorted_by_triple_dictionary_order(self):
+        result = self.model.construct(
+            "CONSTRUCT { ?y knows ?x . ?x friendOf ?z }"
+            " WHERE { ?x knows ?y . OPTIONAL { ?x friendOf ?z } }"
+        )
+        self.assertEqual(result, tuple(sorted(result)))
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("bob", "knows", "alice"),
+                Triple("carol", "knows", "bob"),
+            ),
+        )
+
+    def test_results_are_immutable_triple_tuples(self):
+        result = self.model.construct(
+            "CONSTRUCT { ?x likes ?y } WHERE { ?x knows ?y }"
+        )
+        self.assertIsInstance(result, tuple)
+        for triple in result:
+            self.assertIsInstance(triple, Triple)
+            self.assertIsInstance(triple, tuple)
+            self.assertEqual(len(triple), 3)
+
+    def test_no_match_returns_empty_tuple_not_error(self):
+        result = self.model.construct(
+            "CONSTRUCT { ?x likes ?y } WHERE { ?x knows nobody }"
+        )
+        self.assertEqual(result, ())
+        self.assertIsInstance(result, tuple)
+
+    def test_where_supports_filter_union_and_property_paths(self):
+        with_filter = self.model.construct(
+            'CONSTRUCT { ?x knows ?y }'
+            ' WHERE { ?x knows ?y . FILTER(?y = "carol") }'
+        )
+        self.assertEqual(with_filter, (Triple("bob", "knows", "carol"),))
+
+        with_union = self.model.construct(
+            "CONSTRUCT { ?x knows carol }"
+            " WHERE { { ?x knows carol } UNION { ?x likes carol } }"
+        )
+        # bob knows carol（显式）与 bob likes carol（显式）两个分支都存在，
+        # 模板实例化结果相同，去重后只有一条
+        self.assertEqual(with_union, (Triple("bob", "knows", "carol"),))
+
+        # WHERE 中使用序列路径：alice knows bob knows carol
+        with_path = self.model.construct(
+            "CONSTRUCT { ?x friendOf ?z } WHERE { ?x knows/knows ?z }"
+        )
+        self.assertEqual(with_path, (Triple("alice", "friendOf", "carol"),))
+
+    def test_repeated_execution_identical(self):
+        text = (
+            "CONSTRUCT { ?x friendOf ?z . ?x knows ?y }"
+            " WHERE { ?x knows ?y . OPTIONAL { ?x friendOf ?z } }"
+        )
+        first = self.model.construct(text)
+        for _ in range(3):
+            self.assertEqual(self.model.construct(text), first)
+
+    def test_construct_does_not_write_back_or_mutate_model(self):
+        before = (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        )
+        result = self.model.construct(
+            "CONSTRUCT { alice knows dave } WHERE { alice knows bob }"
+        )
+        self.assertEqual(result, (Triple("alice", "knows", "dave"),))
+        after = (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        )
+        self.assertEqual(before, after)
+        # 生成的三元组不写回模型：蕴含、查询、解释都观察不到它
+        self.assertFalse(self.model.entails("alice", "knows", "dave"))
+        self.assertIsNone(self.model.source_rule("alice", "knows", "dave"))
+        self.assertEqual(self.model.explain("alice", "knows", "dave"), ())
+        self.assertFalse(
+            self.model.ask("ASK WHERE { alice knows dave }")
+        )
+
+    def test_json_string_terms_follow_exact_literal_convention(self):
+        result = self.model.construct(
+            'CONSTRUCT { ?x likes "bob" } WHERE { ?x knows "bob" }'
+        )
+        self.assertEqual(result, (Triple("alice", "likes", "bob"),))
+
+
+class ConstructSyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def assertConstructError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.construct(text)
+        message = str(ctx.exception)
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+        return message
+
+    def test_non_string_input_reports_received_type(self):
+        for bad in (123, None, ["CONSTRUCT"]):
+            with self.assertRaises(OntologyError) as ctx:
+                self.model.construct(bad)
+            self.assertIn(type(bad).__name__, str(ctx.exception))
+
+    def test_empty_query(self):
+        self.assertConstructError("", "CONSTRUCT")
+        self.assertConstructError("   \n\t", "CONSTRUCT")
+
+    def test_lowercase_keywords_rejected(self):
+        self.assertConstructError(
+            "construct { ?x likes ?y } WHERE { ?x knows ?y }", "CONSTRUCT"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y } where { ?x knows ?y }", "WHERE"
+        )
+
+    def test_select_and_ask_forms_rejected(self):
+        self.assertConstructError(
+            "SELECT ?x WHERE { ?x knows ?y }", "CONSTRUCT"
+        )
+        self.assertConstructError(
+            "ASK WHERE { ?x knows ?y }", "CONSTRUCT"
+        )
+
+    def test_missing_where(self):
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y }", "WHERE"
+        )
+
+    def test_missing_braces(self):
+        self.assertConstructError(
+            "CONSTRUCT ?x likes ?y } WHERE { ?x knows ?y }", "'{'"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y . ?x knows", "}"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y } WHERE ?x knows ?y }", "'{'"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y } WHERE { ?x knows ?y", "'}'"
+        )
+
+    def test_trailing_content_rejected(self):
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y } WHERE { ?x knows ?y } ?z",
+            "未知语句成分",
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y } WHERE { ?x knows ?y } }",
+            "未知语句成分",
+        )
+
+    def test_empty_template_rejected(self):
+        self.assertConstructError(
+            "CONSTRUCT { } WHERE { ?x knows ?y }", "空"
+        )
+        self.assertConstructError(
+            "CONSTRUCT {  } WHERE { ?x knows ?y }", "空"
+        )
+
+    def test_template_arity_too_few_or_many(self):
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes } WHERE { ?x knows ?y }", "项数不足"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x } WHERE { ?x knows ?y }", "项数不足"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y ?z } WHERE { ?x knows ?y }", "项数过多"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y . ?x knows } WHERE { ?x knows ?y }",
+            "项数不足",
+        )
+
+    def test_template_variable_predicate_rejected(self):
+        self.assertConstructError(
+            "CONSTRUCT { ?x ?p ?y } WHERE { ?x knows ?y }", "谓语", "变量"
+        )
+
+    def test_template_undeclared_predicate_rejected(self):
+        self.assertConstructError(
+            "CONSTRUCT { ?x unknown ?y } WHERE { ?x knows ?y }",
+            "未声明",
+            "unknown",
+        )
+        self.assertConstructError(
+            'CONSTRUCT { ?x "unknown" ?y } WHERE { ?x knows ?y }',
+            "未声明",
+        )
+
+    def test_template_property_path_rejected(self):
+        self.assertConstructError(
+            "CONSTRUCT { ?x knows* ?y } WHERE { ?x knows ?y }", "路径"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x knows * ?y } WHERE { ?x knows ?y }", "路径"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x knows/likes ?y } WHERE { ?x knows ?y }", "未声明"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x ^knows ?y } WHERE { ?x knows ?y }", "未声明"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x (knows) ?y } WHERE { ?x knows ?y }"
+        )
+
+    def test_optional_filter_union_in_template_rejected(self):
+        self.assertConstructError(
+            "CONSTRUCT { OPTIONAL { ?x knows ?y } } WHERE { ?x knows ?y }",
+            "OPTIONAL",
+        )
+        self.assertConstructError(
+            "CONSTRUCT { FILTER(BOUND(?x)) } WHERE { ?x knows ?y }",
+            "FILTER",
+        )
+        self.assertConstructError(
+            "CONSTRUCT { { ?x knows ?y } UNION { ?x likes ?y } }"
+            " WHERE { ?x knows ?y }",
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x knows ?y UNION { ?x likes ?y } }"
+            " WHERE { ?x knows ?y }",
+            "UNION",
+        )
+
+    def test_template_dot_placement_rules(self):
+        self.assertConstructError(
+            "CONSTRUCT { . ?x likes ?y } WHERE { ?x knows ?y }", "'.'"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y .. ?x knows ?y } WHERE { ?x knows ?y }",
+            "'.'",
+        )
+
+    def test_where_lexical_and_grammar_errors_propagate(self):
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y } WHERE { }", "空"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y } WHERE { ?x unknown ?z }", "未声明"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y } WHERE { ?x knows/unknown ?z }", "未声明"
+        )
+        self.assertConstructError(
+            "CONSTRUCT { ?x likes ?y } WHERE { ?x knows** ?z }", "量词"
+        )
+        self.assertConstructError(
+            'CONSTRUCT { ?x likes ?y } WHERE { ?x likes "bob }', "字符位置"
+        )
+
+    def test_legal_query_without_match_returns_empty_tuple(self):
+        self.assertEqual(
+            self.model.construct(
+                "CONSTRUCT { ?x likes ?y } WHERE { ?x likes nobody }"
+            ),
+            (),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
