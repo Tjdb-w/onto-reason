@@ -106,7 +106,7 @@ class OntologyEngine:
         发现语义冲突时抛出 InconsistencyError，不返回模型；结构与输入错误
         抛出 OntologyError。需要结构化诊断时使用 diagnose。
         """
-        model, conflicts = self._build(text)
+        model, conflicts, evidence = self._build(text)
         if conflicts is not None:
             lines = [f"本体一致性诊断发现 {len(conflicts)} 处冲突："]
             lines.extend(conflict["message"] for conflict in conflicts)
@@ -122,9 +122,9 @@ class OntologyEngine:
         model 为 None、diagnostics 列出全部两两冲突，顺序与 parse 的
         InconsistencyError 冲突行一致。
         """
-        model, conflicts = self._build(text)
+        model, conflicts, evidence = self._build(text)
         if conflicts is not None:
-            return ValidationReport(False, None, conflicts)
+            return ValidationReport(False, None, conflicts, model, evidence)
         return ValidationReport(True, model, ())
 
     def __call__(self, text) -> OntologyModel:
@@ -132,11 +132,14 @@ class OntologyEngine:
 
     # ---------- 解析、推理与一致性检查的共同流程 ----------
 
-    def _build(self, text) -> Tuple[OntologyModel, Optional[List[dict]]]:
-        """返回 (模型, 冲突列表)；无冲突时冲突列表为 None。
+    def _build(self, text) -> Tuple[OntologyModel, Optional[List[dict]], Optional[List[Tuple[Triple, Triple]]]]:
+        """返回 (模型, 冲突列表, 证据三元组列表)；无冲突时后两者为 None。
 
         结构非法在抛出 OntologyError 前终止，与历史 parse 行为一致；
-        一致性检查不通过时模型不返回（调用方只取冲突列表）。
+        一致性检查不通过时模型不返回给调用方（diagnose 仅内部持有用于
+        explain_diagnostic 追溯推理事实的完整证明）。证据三元组列表与
+        冲突列表平行，每项给出参与该冲突的两条事实，顺序与对应诊断的
+        evidence 两项一致。
         """
         data = self._load_json(text)
         self._validate_root(data)
@@ -146,12 +149,14 @@ class OntologyEngine:
         consistency = self._parse_consistency(data, classes, properties)
         derived = self._forward_chain(explicit, rules)
         conflicts: Optional[List[dict]] = None
+        evidence: Optional[List[Tuple[Triple, Triple]]] = None
         if consistency is not None:
             found = self._collect_conflicts(
                 explicit, derived, consistency, classes, individuals
             )
             if found:
-                conflicts = found
+                conflicts = [diagnostic for _, diagnostic, _ in found]
+                evidence = [pair for _, _, pair in found]
         model = OntologyModel(
             explicit,
             derived,
@@ -161,7 +166,7 @@ class OntologyEngine:
                 for rule in rules
             ),
         )
-        return model, conflicts
+        return model, conflicts, evidence
 
     # ---------- 解析与校验 ----------
 
@@ -545,7 +550,12 @@ class OntologyEngine:
         classes: frozenset,
         individuals: frozenset,
     ) -> List[dict]:
-        """收集全部两两冲突，按与 InconsistencyError 相同的顺序排列。"""
+        """收集全部两两冲突，按与 InconsistencyError 相同的顺序排列。
+
+        每项为 (排序键, 诊断字典, (证据三元组1, 证据三元组2))；证据三元组
+        与诊断 evidence 两项一一对应：互斥类为 (个体, 成员谓语, 类名)，
+        函数型属性为 (个体, 约束属性, 取值)。
+        """
         # 全部事实的来源表：显式事实为 None，推理结论为来源规则 id。
         fact_source: Dict[Triple, Optional[object]] = {t: None for t in explicit}
         fact_source.update(derived)
@@ -553,10 +563,12 @@ class OntologyEngine:
         membership = self._membership_facts(
             fact_source, consistency.membership_predicate, classes, individuals
         )
-        # 各收集器返回 (排序键, 诊断字典) 元组列表。
+        # 各收集器返回 (排序键, 诊断字典, 证据三元组对) 元组列表。
         conflicts = []
         conflicts.extend(
-            self._disjoint_conflicts(membership, consistency.disjoint)
+            self._disjoint_conflicts(
+                membership, consistency.disjoint, consistency.membership_predicate
+            )
         )
         conflicts.extend(
             self._functional_conflicts(fact_source, consistency.functional)
@@ -566,7 +578,7 @@ class OntologyEngine:
 
         # 按约束 id 的字符串表示、冲突类型、subject、冲突条目字典序排列。
         conflicts.sort(key=lambda item: item[0])
-        return [diagnostic for _, diagnostic in conflicts]
+        return conflicts
 
     def _membership_facts(
         self,
@@ -587,7 +599,7 @@ class OntologyEngine:
             membership.setdefault((triple.subject, triple.object), source)
         return membership
 
-    def _disjoint_conflicts(self, membership, constraints):
+    def _disjoint_conflicts(self, membership, constraints, predicate: str):
         conflicts = []
         for constraint in constraints:
             names = sorted(constraint.classes)
@@ -630,7 +642,11 @@ class OntologyEngine:
                             first,
                             second,
                         )
-                        conflicts.append((key, diagnostic))
+                        pair = (
+                            Triple(subject, predicate, first),
+                            Triple(subject, predicate, second),
+                        )
+                        conflicts.append((key, diagnostic, pair))
         return conflicts
 
     def _functional_conflicts(self, fact_source: Dict[Triple, Optional[object]], constraints):
@@ -678,7 +694,11 @@ class OntologyEngine:
                             first,
                             second,
                         )
-                        conflicts.append((key, diagnostic))
+                        pair = (
+                            Triple(subject, property_, first),
+                            Triple(subject, property_, second),
+                        )
+                        conflicts.append((key, diagnostic, pair))
         return conflicts
 
     @staticmethod

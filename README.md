@@ -73,3 +73,28 @@ SELECT (?变量 ... | *) WHERE {
   `{"kind": "derived", "ruleId": ...}`（推理事实，`ruleId` 为原始规则 id）。
 - `message` 与 `parse` 抛出的冲突行逐字一致，重复诊断同一输入得到相同报告。
 
+### 冲突事实的证明追溯
+
+`ValidationReport.explain_diagnostic(index)` 输入诊断在 `diagnostics` 中的
+零基下标，返回与该诊断 `evidence` 两项顺序一致的二元组，分别证明参与冲突的
+两条事实：
+
+- `disjointClassMembership`：两项分别证明个体经当前
+  `classMembershipPredicate` 表达的两项类成员事实
+  `(subject, classMembershipPredicate, class)`；
+- `functionalPropertyValue`：两项分别证明个体在约束属性上的两个不同取值
+  事实 `(subject, property, object)`。
+
+每项是一个 `Proof` 元组：
+
+- 显式事实恰含一个 `kind` 为 `"explicit"`、`ruleId` 为 `None`、
+  `premises` 为空的 `Proof`；
+- 推理事实为 `OntologyModel.explain` 对该三元组给出的全部最短完整证明，
+  保留原始规则 id、规则 `if` 模式顺序与稳定排序；`premises` 逐层指向推导
+  前提并到达显式叶子，循环规则下有限结束且不包含依赖循环的证明。
+
+重复调用结果一致，返回的元组、`Proof` 与嵌套 `premises` 均为只读快照，
+调用方修改不影响后续结果。下标为非整数（`bool` 不算整数）、负数、越界，
+或 `diagnostics` 为空时调用，均抛出 `OntologyError`，消息包含收到的下标
+或空诊断说明。
+

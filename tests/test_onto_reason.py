@@ -2644,5 +2644,440 @@ class ExplainTests(unittest.TestCase):
         )
 
 
+def explain_doc(**overrides):
+    """带成员谓语与类型声明的文档，供 explain_diagnostic 测试使用。"""
+    return consistency_doc(
+        classes=["Person", "Robot", "Animal"],
+        properties=["rdfType", "knows", "likes", "age"],
+        **overrides,
+    )
+
+
+def explain_section(disjoint=None, functional=None):
+    return consistency_section(
+        disjoint=disjoint, functional=functional, predicate="rdfType"
+    )
+
+
+def diagnose_json(doc):
+    return OntologyEngine().diagnose(json.dumps(doc, ensure_ascii=False))
+
+
+def iter_proof_nodes(proof):
+    yield proof
+    for premise in proof.premises:
+        yield from iter_proof_nodes(premise)
+
+
+class ExplainDiagnosticTests(unittest.TestCase):
+    """ValidationReport.explain_diagnostic 的冲突事实追溯行为。"""
+
+    def derived_disjoint_report(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-to-robot",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?x", "predicate": "rdfType", "object": "Robot"}
+                ],
+            }
+        ]
+        section = explain_section(
+            disjoint=[{"id": 9, "classes": ["Person", "Robot"]}]
+        )
+        return diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+
+    def test_explicit_disjoint_facts_each_have_single_explicit_proof(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+        ]
+        section = explain_section(
+            disjoint=[{"id": "d1", "classes": ["Robot", "Person"]}]
+        )
+        report = diagnose_json(explain_doc(triples=triples, consistency=section))
+        result = report.explain_diagnostic(0)
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        # 顺序与 evidence 两项一致：Person 先、Robot 后
+        classes = [item["class"] for item in report.diagnostics[0]["evidence"]]
+        self.assertEqual(classes, ["Person", "Robot"])
+        for proofs, class_name in zip(result, ("Person", "Robot")):
+            self.assertIsInstance(proofs, tuple)
+            self.assertEqual(len(proofs), 1)
+            proof = proofs[0]
+            self.assertEqual(proof.kind, "explicit")
+            self.assertIsNone(proof.ruleId)
+            self.assertEqual(proof.premises, ())
+            self.assertEqual(
+                proof.triple, Triple("alice", "rdfType", class_name)
+            )
+            self.assertIsInstance(proof.triple, Triple)
+
+    def test_derived_fact_uses_full_rule_proof_in_evidence_order(self):
+        report = self.derived_disjoint_report()
+        first_proofs, second_proofs = report.explain_diagnostic(0)
+        # 第一项：Person 为显式事实
+        self.assertEqual(len(first_proofs), 1)
+        explicit_proof = first_proofs[0]
+        self.assertEqual(explicit_proof.kind, "explicit")
+        self.assertEqual(
+            explicit_proof.triple, Triple("alice", "rdfType", "Person")
+        )
+        # 第二项：Robot 为规则 r-to-robot 的推理结论
+        self.assertEqual(len(second_proofs), 1)
+        rule_proof = second_proofs[0]
+        self.assertEqual(rule_proof.kind, "rule")
+        self.assertEqual(rule_proof.ruleId, "r-to-robot")
+        self.assertEqual(
+            rule_proof.triple, Triple("alice", "rdfType", "Robot")
+        )
+        self.assertEqual(
+            [premise.triple for premise in rule_proof.premises],
+            [Triple("alice", "knows", "bob")],
+        )
+        self.assertTrue(all(p.kind == "explicit" for p in rule_proof.premises))
+
+    def test_functional_evidence_triples_use_constraint_property(self):
+        triples = [
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "age", "object": "50"},
+        ]
+        rules = [
+            {
+                "id": 42,
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "age", "object": "40"}],
+            }
+        ]
+        section = explain_section(
+            functional=[{"id": "f-age", "property": "age"}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        objects = [item["object"] for item in report.diagnostics[0]["evidence"]]
+        self.assertEqual(objects, ["40", "50"])
+        derived_proofs, explicit_proofs = report.explain_diagnostic(0)
+        derived = derived_proofs[0]
+        self.assertEqual(derived.kind, "rule")
+        self.assertEqual(derived.ruleId, 42)
+        self.assertIsInstance(derived.ruleId, int)
+        self.assertEqual(derived.triple, Triple("bob", "age", "40"))
+        self.assertEqual(
+            derived.premises[0].triple, Triple("bob", "knows", "carol")
+        )
+        explicit = explicit_proofs[0]
+        self.assertEqual(explicit.kind, "explicit")
+        self.assertIsNone(explicit.ruleId)
+        self.assertEqual(explicit.triple, Triple("bob", "age", "50"))
+
+    def test_multi_level_premises_follow_if_pattern_order_to_leaves(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+        ]
+        rules = [
+            {
+                "id": "fof-robot",
+                "if": [
+                    {"subject": "?x", "predicate": "knows", "object": "?y"},
+                    {"subject": "?y", "predicate": "knows", "object": "?z"},
+                ],
+                "then": [
+                    {"subject": "?x", "predicate": "rdfType", "object": "Robot"}
+                ],
+            }
+        ]
+        section = explain_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        _, robot_proofs = report.explain_diagnostic(0)
+        (proof,) = robot_proofs
+        self.assertEqual(proof.ruleId, "fof-robot")
+        # premises 严格按规则 if 模式顺序，且均为显式叶子
+        self.assertEqual(
+            [premise.triple for premise in proof.premises],
+            [Triple("alice", "knows", "bob"), Triple("bob", "knows", "carol")],
+        )
+        self.assertTrue(all(p.kind == "explicit" for p in proof.premises))
+
+    def test_chained_rules_premises_point_to_derivation_step(self):
+        triples = [
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "age", "object": "50"},
+        ]
+        rules = [
+            {
+                "id": "k2l",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?x", "predicate": "likes", "object": "?y"}
+                ],
+            },
+            {
+                "id": "l2age",
+                "if": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "age", "object": "40"}],
+            },
+        ]
+        section = explain_section(
+            functional=[{"id": "f-age", "property": "age"}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        derived_proofs, _ = report.explain_diagnostic(0)
+        (proof,) = derived_proofs
+        self.assertEqual(proof.ruleId, "l2age")
+        self.assertEqual(len(proof.premises), 1)
+        inner = proof.premises[0]
+        self.assertEqual(inner.kind, "rule")
+        self.assertEqual(inner.ruleId, "k2l")
+        self.assertEqual(inner.triple, Triple("bob", "likes", "carol"))
+        (leaf,) = inner.premises
+        self.assertEqual(leaf.kind, "explicit")
+        self.assertEqual(leaf.triple, Triple("bob", "knows", "carol"))
+
+    def test_all_shortest_proofs_returned_with_stable_rule_order(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": name,
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?x", "predicate": "rdfType", "object": "Robot"}
+                ],
+            }
+            for name in ("r2", "r1")
+        ]
+        section = explain_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        _, robot_proofs = report.explain_diagnostic(0)
+        self.assertEqual([p.ruleId for p in robot_proofs], ["r1", "r2"])
+
+    def test_ground_rule_with_empty_if_has_no_premises(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+        ]
+        rules = [
+            {
+                "id": "ground-robot",
+                "if": [],
+                "then": [
+                    {"subject": "alice", "predicate": "rdfType", "object": "Robot"}
+                ],
+            }
+        ]
+        section = explain_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        _, robot_proofs = report.explain_diagnostic(0)
+        (proof,) = robot_proofs
+        self.assertEqual(proof.kind, "rule")
+        self.assertEqual(proof.ruleId, "ground-robot")
+        self.assertEqual(proof.premises, ())
+
+    def test_index_selects_diagnostic_evidence_pair(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Animal"},
+            {"subject": "alice", "predicate": "age", "object": "1"},
+            {"subject": "alice", "predicate": "age", "object": "2"},
+        ]
+        section = explain_section(
+            disjoint=[{"id": "d1", "classes": ["Animal", "Person", "Robot"]}],
+            functional=[{"id": "f1", "property": "age"}],
+        )
+        report = diagnose_json(explain_doc(triples=triples, consistency=section))
+        diagnostics = report.diagnostics
+        self.assertEqual(len(diagnostics), 4)
+        for index, diagnostic in enumerate(diagnostics):
+            result = report.explain_diagnostic(index)
+            evidence = diagnostic["evidence"]
+            if diagnostic["kind"] == "disjointClassMembership":
+                expected = [
+                    Triple("alice", "rdfType", item["class"]) for item in evidence
+                ]
+            else:
+                expected = [
+                    Triple("alice", "age", item["object"]) for item in evidence
+                ]
+            self.assertEqual(
+                [proofs[0].triple for proofs in result], expected
+            )
+
+    def test_matches_model_explain_on_equivalent_consistent_doc(self):
+        # 去掉互斥约束后同一套事实/规则可正常 parse，追溯结果应与
+        # OntologyModel.explain 对相应三元组给出的证明完全一致。
+        report = self.derived_disjoint_report()
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-to-robot",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?x", "predicate": "rdfType", "object": "Robot"}
+                ],
+            }
+        ]
+        model = parse(explain_doc(triples=triples, rules=rules))
+        first_proofs, second_proofs = report.explain_diagnostic(0)
+        self.assertEqual(
+            first_proofs, model.explain("alice", "rdfType", "Person")
+        )
+        self.assertEqual(
+            second_proofs, model.explain("alice", "rdfType", "Robot")
+        )
+
+    def test_cyclic_rules_terminate_without_cyclic_proofs(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "p2q",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?x", "predicate": "rdfType", "object": "Robot"}
+                ],
+            },
+            {
+                "id": "q2p",
+                "if": [
+                    {"subject": "?x", "predicate": "rdfType", "object": "Robot"}
+                ],
+                "then": [
+                    {"subject": "?x", "predicate": "knows", "object": "bob"}
+                ],
+            },
+        ]
+        section = explain_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        _, robot_proofs = report.explain_diagnostic(0)
+        self.assertEqual([p.ruleId for p in robot_proofs], ["p2q"])
+        proof = robot_proofs[0]
+        root = proof.triple
+        # 证明树中每个三元组节点只出现一次：不存在依赖目标自身的循环证明
+        for node in iter_proof_nodes(proof):
+            self.assertEqual(
+                sum(n.triple == node.triple for n in iter_proof_nodes(proof)),
+                1,
+            )
+        self.assertTrue(all(p.kind == "explicit" for p in proof.premises))
+        # 重复调用同样有限结束
+        report.explain_diagnostic(0)
+
+    def test_repeated_calls_return_equal_distinct_snapshots(self):
+        report = self.derived_disjoint_report()
+        first = report.explain_diagnostic(0)
+        for _ in range(3):
+            again = report.explain_diagnostic(0)
+            self.assertEqual(again, first)
+            self.assertIsNot(again, first)
+            self.assertIsNot(again[0], first[0])
+            self.assertIsNot(again[1], first[1])
+
+    def test_returned_proofs_are_read_only_and_isolated(self):
+        report = self.derived_disjoint_report()
+        result = report.explain_diagnostic(0)
+        self.assertIsInstance(result, tuple)
+        for proofs in result:
+            self.assertIsInstance(proofs, tuple)
+            for proof in proofs:
+                self.assertIsInstance(proof.premises, tuple)
+                for attr, value in (
+                    ("kind", "x"),
+                    ("triple", None),
+                    ("ruleId", "y"),
+                    ("premises", ()),
+                ):
+                    with self.assertRaises(AttributeError):
+                        setattr(proof, attr, value)
+        snapshot = report.explain_diagnostic(0)
+        # 调用方持有旧结果后再次调用，内容不受任何影响
+        self.assertEqual(report.explain_diagnostic(0), snapshot)
+        # 报告的其余读取结果也不变
+        diagnostics = report.diagnostics
+        self.assertEqual(report.diagnostics, diagnostics)
+        self.assertIsNone(report.model)
+
+    def test_non_integer_bool_negative_and_out_of_range_raise(self):
+        report = self.derived_disjoint_report()
+        self.assertEqual(len(report.diagnostics), 1)
+        for bad in (1, 2, -1):
+            with self.assertRaises(OntologyError) as ctx:
+                report.explain_diagnostic(bad)
+            self.assertIn(str(bad), str(ctx.exception))
+        for bad in (1.0, 1.5, "0", None, [0], object()):
+            with self.assertRaises(OntologyError) as ctx:
+                report.explain_diagnostic(bad)
+            self.assertIn("整数", str(ctx.exception))
+        # bool 不被当作整数 1
+        with self.assertRaises(OntologyError) as ctx:
+            report.explain_diagnostic(True)
+        self.assertIn("整数", str(ctx.exception))
+        self.assertIn("True", str(ctx.exception))
+        with self.assertRaises(OntologyError) as ctx:
+            report.explain_diagnostic(False)
+        self.assertIn("整数", str(ctx.exception))
+
+    def test_empty_diagnostics_always_raises_with_empty_note(self):
+        section = explain_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}],
+            functional=[{"id": "f1", "property": "age"}],
+        )
+        report = diagnose_json(explain_doc(consistency=section))
+        self.assertTrue(report.is_consistent)
+        self.assertEqual(report.diagnostics, ())
+        for index in (0, -1, 2):
+            with self.assertRaises(OntologyError) as ctx:
+                report.explain_diagnostic(index)
+            message = str(ctx.exception)
+            self.assertIn("diagnostics 为空", message)
+            self.assertIn(str(index), message)
+        # 非整数下标同样报错（类型校验优先）
+        with self.assertRaises(OntologyError) as ctx:
+            report.explain_diagnostic("0")
+        self.assertIn("整数", str(ctx.exception))
+
+    def test_explain_diagnostic_does_not_change_report(self):
+        report = self.derived_disjoint_report()
+        before = (report.is_consistent, report.model, report.diagnostics)
+        report.explain_diagnostic(0)
+        report.explain_diagnostic(0)
+        after = (report.is_consistent, report.model, report.diagnostics)
+        self.assertEqual(before, after)
+
+
 if __name__ == "__main__":
     unittest.main()
