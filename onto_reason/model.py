@@ -10,7 +10,7 @@ import itertools
 from typing import Iterator, Optional, Tuple
 
 from .errors import OntologyError
-from .query import QueryResult, run_ask, run_query
+from .query import QueryResult, run_ask, run_construct, run_query
 
 _VARIABLE_PREFIX = "?"
 
@@ -203,6 +203,7 @@ class OntologyModel:
     - entails(s, p, o)：判断单条三元组是否被蕴含（显式或推理得出）。
     - explain(s, p, o)：给出该三元组的全部最短完整证明（Proof 元组）。
     - ask(text)：SPARQL 风格 ASK 存在性查询，返回布尔值。
+    - construct(text)：SPARQL 风格 CONSTRUCT 查询，返回生成的 Triple 元组。
     - declared_properties：本体中已声明的属性名（查询谓语/属性路径据此校验）。
     所有读取接口均返回新对象，不改变模型内部数据。
     """
@@ -393,3 +394,22 @@ class OntologyModel:
         属性路径引用未声明属性时抛出 OntologyError。
         """
         return run_ask(self, text)
+
+    def construct(self, text: str) -> Tuple[Triple, ...]:
+        """执行 SPARQL 风格 CONSTRUCT 查询，从既有事实与推理结论生成新三元组。
+
+        形式为 CONSTRUCT { 三元组模板... } WHERE { 模式体 }：WHERE 模式体与
+        query/ask 完全同语法、同语义（三元组模式、OPTIONAL、FILTER、UNION
+        与谓语属性路径，均在显式与推理三元组的并集上求值）；模板由一个或
+        多个固定三项的三元组模板组成，模板之间用点号分隔，末尾点号可省略。
+        模板主语/宾语为变量或常量，谓语只接受已声明的常量属性名，不接受
+        变量谓语、属性路径、OPTIONAL、FILTER 或 UNION；关键字只接受大写。
+        对每个通过 WHERE 条件的最终绑定逐项实例化模板；主语或宾语变量在
+        该绑定中未绑定时不生成对应三元组，其余模板继续处理。
+        返回按字典序去重排序的 Triple 只读元组；合法查询没有匹配时返回
+        空元组。生成的三元组不写回模型，不影响后续查询或解释结果，重复
+        执行同一模型与查询结果一致。输入不是字符串、查询为空、模板为空、
+        缺少 WHERE、花括号不配对、词法或语法非法、模板谓语为变量/属性路径/
+        未声明属性时抛出 OntologyError。
+        """
+        return run_construct(self, text)
