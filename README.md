@@ -39,3 +39,29 @@ SELECT (?变量 ... | *) WHERE {
   多个 FILTER 按逻辑与共同过滤。
 - 未绑定的投影变量在结果行中以 `None` 占位；结果按投影去重并按字典序排序。
 
+## 一致性诊断
+
+`OntologyEngine.parse` 在结构校验与不动点推理完成后检查 `consistency` 约束，
+发现互斥类成员或函数型属性多值冲突时抛出 `InconsistencyError`，不返回模型。
+
+`OntologyEngine.diagnose` 接受与 `parse` 相同的输入（`str` 或 UTF-8 `bytes`），
+结构、JSON、UTF-8 非法时同样抛出带定位信息的 `OntologyError`；语义冲突不抛异常，
+而是返回只读的 `ValidationReport`：
+
+- `is_consistent`：无冲突为 `True`，有冲突为 `False`。
+- `model`：一致时为推理后的 `OntologyModel`（与 `parse` 返回值语义相同）；
+  有冲突时为 `None`。
+- `diagnostics`：诊断元组，无冲突为空；有冲突时包含全部两两冲突，顺序与
+  `InconsistencyError` 中的冲突行一致。
+
+每条诊断是字段固定为 `kind`、`constraintId`、`subject`、`evidence`、`message`
+的字典：
+
+- `kind` 为 `"disjointClassMembership"` 或 `"functionalPropertyValue"`；
+  前者 `evidence` 恰含 `class` 与 `source` 两项且类名按字典序排列，
+  后者恰含 `object` 与 `source` 两项且取值按字典序排列。
+- `constraintId` 保留原始字符串或整数。
+- `source` 为 `{"kind": "explicit"}`（显式事实）或
+  `{"kind": "derived", "ruleId": ...}`（推理事实，`ruleId` 为原始规则 id）。
+- `message` 与 `parse` 抛出的冲突行逐字一致，重复诊断同一输入得到相同报告。
+

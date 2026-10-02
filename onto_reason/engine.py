@@ -18,7 +18,9 @@
 
 一致性诊断在结构校验与不动点推理完成后进行：同一个体同时属于一条
 disjointClasses 约束中的两个类、或在一条 functionalProperties 约束的属性上
-有两个不同取值，都抛出 InconsistencyError 且不返回模型。
+有两个不同取值，parse 抛出 InconsistencyError 且不返回模型；diagnose 不抛
+异常，改为返回 ValidationReport（is_consistent 为 False、model 为 None、
+diagnostics 按与异常冲突行相同的顺序列出全部两两冲突）。
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .errors import InconsistencyError, OntologyError
 from .model import OntologyModel, Triple
+from .report import ValidationReport
 
 _ROOT_FIELDS = ("classes", "properties", "individuals", "triples", "rules")
 _TRIPLE_KEYS = frozenset({"subject", "predicate", "object"})
@@ -98,7 +101,43 @@ class OntologyEngine:
     """公开入口：解析本体定义文本，返回可重复读取的 OntologyModel。"""
 
     def parse(self, text) -> OntologyModel:
-        """解析 UTF-8 文本形式的 JSON 本体定义并完成前向链推理。"""
+        """解析 UTF-8 文本形式的 JSON 本体定义并完成前向链推理。
+
+        发现语义冲突时抛出 InconsistencyError，不返回模型；结构与输入错误
+        抛出 OntologyError。需要结构化诊断时使用 diagnose。
+        """
+        model, conflicts = self._build(text)
+        if conflicts is not None:
+            lines = [f"本体一致性诊断发现 {len(conflicts)} 处冲突："]
+            lines.extend(conflict["message"] for conflict in conflicts)
+            raise InconsistencyError("\n".join(lines))
+        return model
+
+    def diagnose(self, text) -> ValidationReport:
+        """与 parse 相同的输入与结构校验，语义冲突以 ValidationReport 返回。
+
+        输入类型、JSON、UTF-8 或结构非法仍抛 OntologyError（消息与 parse
+        完全一致）。无冲突时报告的 is_consistent 为 True、model 为推理后的
+        OntologyModel、diagnostics 为空元组；有冲突时 is_consistent 为 False、
+        model 为 None、diagnostics 列出全部两两冲突，顺序与 parse 的
+        InconsistencyError 冲突行一致。
+        """
+        model, conflicts = self._build(text)
+        if conflicts is not None:
+            return ValidationReport(False, None, conflicts)
+        return ValidationReport(True, model, ())
+
+    def __call__(self, text) -> OntologyModel:
+        return self.parse(text)
+
+    # ---------- 解析、推理与一致性检查的共同流程 ----------
+
+    def _build(self, text) -> Tuple[OntologyModel, Optional[List[dict]]]:
+        """返回 (模型, 冲突列表)；无冲突时冲突列表为 None。
+
+        结构非法在抛出 OntologyError 前终止，与历史 parse 行为一致；
+        一致性检查不通过时模型不返回（调用方只取冲突列表）。
+        """
         data = self._load_json(text)
         self._validate_root(data)
         classes, properties, individuals = self._collect_names(data)
@@ -106,14 +145,15 @@ class OntologyEngine:
         rules = self._parse_rules(data["rules"], properties)
         consistency = self._parse_consistency(data, classes, properties)
         derived = self._forward_chain(explicit, rules)
+        conflicts: Optional[List[dict]] = None
         if consistency is not None:
-            self._check_consistency(
+            found = self._collect_conflicts(
                 explicit, derived, consistency, classes, individuals
             )
-        return OntologyModel(explicit, derived)
-
-    def __call__(self, text) -> OntologyModel:
-        return self.parse(text)
+            if found:
+                conflicts = found
+        model = OntologyModel(explicit, derived)
+        return model, conflicts
 
     # ---------- 解析与校验 ----------
 
@@ -489,14 +529,15 @@ class OntologyEngine:
 
     # ---------- 一致性诊断 ----------
 
-    def _check_consistency(
+    def _collect_conflicts(
         self,
         explicit: List[Triple],
         derived: Dict[Triple, object],
         consistency: _Consistency,
         classes: frozenset,
         individuals: frozenset,
-    ) -> None:
+    ) -> List[dict]:
+        """收集全部两两冲突，按与 InconsistencyError 相同的顺序排列。"""
         # 全部事实的来源表：显式事实为 None，推理结论为来源规则 id。
         fact_source: Dict[Triple, Optional[object]] = {t: None for t in explicit}
         fact_source.update(derived)
@@ -504,6 +545,7 @@ class OntologyEngine:
         membership = self._membership_facts(
             fact_source, consistency.membership_predicate, classes, individuals
         )
+        # 各收集器返回 (排序键, 诊断字典) 元组列表。
         conflicts = []
         conflicts.extend(
             self._disjoint_conflicts(membership, consistency.disjoint)
@@ -512,13 +554,11 @@ class OntologyEngine:
             self._functional_conflicts(fact_source, consistency.functional)
         )
         if not conflicts:
-            return
+            return []
 
         # 按约束 id 的字符串表示、冲突类型、subject、冲突条目字典序排列。
-        conflicts.sort(key=lambda c: c[0])
-        lines = [f"本体一致性诊断发现 {len(conflicts)} 处冲突："]
-        lines.extend(c[1] for c in conflicts)
-        raise InconsistencyError("\n".join(lines))
+        conflicts.sort(key=lambda item: item[0])
+        return [diagnostic for _, diagnostic in conflicts]
 
     def _membership_facts(
         self,
@@ -565,6 +605,16 @@ class OntologyEngine:
                             f"{first!r} 为{self._describe_source(src1)}；"
                             f"{second!r} 为{self._describe_source(src2)}"
                         )
+                        diagnostic = {
+                            "kind": "disjointClassMembership",
+                            "constraintId": constraint.constraint_id,
+                            "subject": subject,
+                            "evidence": (
+                                {"class": first, "source": self._source_info(src1)},
+                                {"class": second, "source": self._source_info(src2)},
+                            ),
+                            "message": message,
+                        }
                         key = (
                             str(constraint.constraint_id),
                             _CONFLICT_DISJOINT,
@@ -572,7 +622,7 @@ class OntologyEngine:
                             first,
                             second,
                         )
-                        conflicts.append((key, message))
+                        conflicts.append((key, diagnostic))
         return conflicts
 
     def _functional_conflicts(self, fact_source: Dict[Triple, Optional[object]], constraints):
@@ -602,6 +652,16 @@ class OntologyEngine:
                             f"{first!r} 为{self._describe_source(src1)}；"
                             f"{second!r} 为{self._describe_source(src2)}"
                         )
+                        diagnostic = {
+                            "kind": "functionalPropertyValue",
+                            "constraintId": constraint.constraint_id,
+                            "subject": subject,
+                            "evidence": (
+                                {"object": first, "source": self._source_info(src1)},
+                                {"object": second, "source": self._source_info(src2)},
+                            ),
+                            "message": message,
+                        }
                         key = (
                             str(constraint.constraint_id),
                             _CONFLICT_FUNCTIONAL,
@@ -610,8 +670,15 @@ class OntologyEngine:
                             first,
                             second,
                         )
-                        conflicts.append((key, message))
+                        conflicts.append((key, diagnostic))
         return conflicts
+
+    @staticmethod
+    def _source_info(source) -> dict:
+        """结构化事实来源：显式事实为 {'kind': 'explicit'}；推理事实带原始规则 id。"""
+        if source is None:
+            return {"kind": "explicit"}
+        return {"kind": "derived", "ruleId": source}
 
     @staticmethod
     def _describe_source(source) -> str:

@@ -7,6 +7,7 @@ from onto_reason import (
     OntologyError,
     QueryResult,
     Triple,
+    ValidationReport,
 )
 
 
@@ -1694,6 +1695,337 @@ class InconsistencyDetectionTests(unittest.TestCase):
         )
         self.assertEqual(without.entails("alice", "knows", "bob"),
                          with_section.entails("alice", "knows", "bob"))
+
+
+class DiagnoseApiTests(unittest.TestCase):
+    """OntologyEngine.diagnose 与 ValidationReport 的结构化诊断行为。"""
+
+    def diagnose(self, doc):
+        return OntologyEngine().diagnose(json.dumps(doc))
+
+    def test_consistent_report_holds_inferred_model(self):
+        rule = {
+            "id": "knows-likes",
+            "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+        }
+        doc = make_doc(rules=[rule])
+        report = self.diagnose(doc)
+        self.assertIsInstance(report, ValidationReport)
+        self.assertTrue(report.is_consistent)
+        self.assertIsInstance(report.model, type(parse(doc)))
+        self.assertEqual(report.model.explicit_triples, parse(doc).explicit_triples)
+        self.assertEqual(report.model.derived_triples, parse(doc).derived_triples)
+        self.assertEqual(report.model.triples, parse(doc).triples)
+        self.assertIsInstance(report.diagnostics, tuple)
+        self.assertEqual(report.diagnostics, ())
+        self.assertEqual(len(report), 0)
+        self.assertEqual(list(report), [])
+        # 报告内模型的查询语义与 parse 结果一致
+        self.assertEqual(
+            report.model.query("SELECT ?x ?y WHERE { ?x knows ?y }").rows,
+            parse(doc).query("SELECT ?x ?y WHERE { ?x knows ?y }").rows,
+        )
+
+    def test_consistency_section_without_conflict_still_consistent(self):
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}],
+            functional=[{"id": "f1", "property": "age"}],
+        )
+        report = self.diagnose(consistency_doc(consistency=section))
+        self.assertTrue(report.is_consistent)
+        self.assertIsNotNone(report.model)
+        self.assertEqual(report.diagnostics, ())
+
+    def test_inconsistent_report_shape(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Robot", "Person"]}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        self.assertFalse(report.is_consistent)
+        self.assertIsNone(report.model)
+        self.assertEqual(len(report), 1)
+        self.assertEqual(len(report.diagnostics), 1)
+        diagnostic = report.diagnostics[0]
+        self.assertEqual(
+            set(diagnostic),
+            {"kind", "constraintId", "subject", "evidence", "message"},
+        )
+        self.assertEqual(diagnostic["kind"], "disjointClassMembership")
+        self.assertEqual(diagnostic["constraintId"], "d1")
+        self.assertEqual(diagnostic["subject"], "alice")
+        evidence = diagnostic["evidence"]
+        self.assertIsInstance(evidence, tuple)
+        self.assertEqual(len(evidence), 2)
+        for item in evidence:
+            self.assertEqual(set(item), {"class", "source"})
+        # 类名按字典序：Person 在 Robot 之前
+        self.assertEqual([item["class"] for item in evidence], ["Person", "Robot"])
+        for item in evidence:
+            self.assertEqual(item["source"], {"kind": "explicit"})
+
+    def test_disjoint_derived_source_carries_rule_id(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-to-robot",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "rdfType", "object": "Robot"}],
+            }
+        ]
+        section = consistency_section(
+            disjoint=[{"id": 9, "classes": ["Person", "Robot"]}]
+        )
+        report = self.diagnose(
+            consistency_doc(triples=triples, rules=rules, consistency=section)
+        )
+        (diagnostic,) = report.diagnostics
+        # constraintId 保留原始整数
+        self.assertEqual(diagnostic["constraintId"], 9)
+        self.assertIsInstance(diagnostic["constraintId"], int)
+        by_class = {item["class"]: item["source"] for item in diagnostic["evidence"]}
+        self.assertEqual(by_class["Person"], {"kind": "explicit"})
+        self.assertEqual(
+            by_class["Robot"], {"kind": "derived", "ruleId": "r-to-robot"}
+        )
+
+    def test_functional_diagnostic_shape_and_sorting(self):
+        triples = [
+            {"subject": "alice", "predicate": "age", "object": "30"},
+            {"subject": "alice", "predicate": "age", "object": "31"},
+        ]
+        section = consistency_section(
+            functional=[{"id": "f-age", "property": "age"}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        (diagnostic,) = report.diagnostics
+        self.assertEqual(
+            set(diagnostic),
+            {"kind", "constraintId", "subject", "evidence", "message"},
+        )
+        self.assertEqual(diagnostic["kind"], "functionalPropertyValue")
+        self.assertEqual(diagnostic["constraintId"], "f-age")
+        self.assertEqual(diagnostic["subject"], "alice")
+        evidence = diagnostic["evidence"]
+        self.assertEqual(len(evidence), 2)
+        for item in evidence:
+            self.assertEqual(set(item), {"object", "source"})
+        # object 按字典序
+        self.assertEqual([item["object"] for item in evidence], ["30", "31"])
+
+    def test_functional_derived_source_keeps_integer_rule_id(self):
+        triples = [
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "age", "object": "50"},
+        ]
+        rules = [
+            {
+                "id": 42,
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "age", "object": "40"}],
+            }
+        ]
+        section = consistency_section(
+            functional=[{"id": "f-age", "property": "age"}]
+        )
+        report = self.diagnose(
+            consistency_doc(triples=triples, rules=rules, consistency=section)
+        )
+        (diagnostic,) = report.diagnostics
+        by_object = {item["object"]: item["source"] for item in diagnostic["evidence"]}
+        self.assertEqual(by_object["40"], {"kind": "derived", "ruleId": 42})
+        self.assertIsInstance(by_object["40"]["ruleId"], int)
+        self.assertEqual(by_object["50"], {"kind": "explicit"})
+
+    def test_all_pairwise_conflicts_listed(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Animal"},
+            {"subject": "alice", "predicate": "age", "object": "1"},
+            {"subject": "alice", "predicate": "age", "object": "2"},
+            {"subject": "alice", "predicate": "age", "object": "3"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Animal", "Person", "Robot"]}],
+            functional=[{"id": "f1", "property": "age"}],
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        kinds = [d["kind"] for d in report.diagnostics]
+        self.assertEqual(kinds.count("disjointClassMembership"), 3)
+        self.assertEqual(kinds.count("functionalPropertyValue"), 3)
+        # 每条互斥诊断的类对唯一且按字典序
+        class_pairs = [
+            tuple(item["class"] for item in d["evidence"])
+            for d in report.diagnostics
+            if d["kind"] == "disjointClassMembership"
+        ]
+        self.assertEqual(
+            sorted(class_pairs),
+            [("Animal", "Person"), ("Animal", "Robot"), ("Person", "Robot")],
+        )
+        object_pairs = [
+            tuple(item["object"] for item in d["evidence"])
+            for d in report.diagnostics
+            if d["kind"] == "functionalPropertyValue"
+        ]
+        self.assertEqual(
+            sorted(object_pairs), [("1", "2"), ("1", "3"), ("2", "3")]
+        )
+
+    def test_messages_and_order_match_parse_error_lines(self):
+        triples = [
+            {"subject": "bob", "predicate": "rdfType", "object": "Person"},
+            {"subject": "bob", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "age", "object": "1"},
+            {"subject": "alice", "predicate": "age", "object": "2"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": 2, "classes": ["Person", "Robot"]}],
+            functional=[{"id": 1, "property": "age"}],
+        )
+        doc = consistency_doc(triples=triples, consistency=section)
+        text = json.dumps(doc)
+        report = OntologyEngine().diagnose(text)
+        with self.assertRaises(InconsistencyError) as ctx:
+            OntologyEngine().parse(text)
+        lines = str(ctx.exception).splitlines()
+        self.assertEqual(lines[0], f"本体一致性诊断发现 {len(report.diagnostics)} 处冲突：")
+        # 每条诊断 message 与 parse 冲突行（正文）逐字一致，顺序也一致
+        self.assertEqual(
+            [d["message"] for d in report.diagnostics], lines[1:]
+        )
+
+    def test_repeated_diagnose_gives_identical_report(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "age", "object": "9"},
+            {"subject": "alice", "predicate": "age", "object": "1"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}],
+            functional=[{"id": "f1", "property": "age"}],
+        )
+        doc = consistency_doc(triples=triples, consistency=section)
+        text = json.dumps(doc)
+        first = OntologyEngine().diagnose(text)
+        for _ in range(3):
+            again = OntologyEngine().diagnose(text)
+            self.assertEqual(again, first)
+            self.assertEqual(again.diagnostics, first.diagnostics)
+        # JSON 键顺序与 triples 顺序变化不影响报告
+        shuffled = {
+            "functionalProperties": None,
+            "rules": doc["rules"],
+            "triples": list(reversed(doc["triples"])),
+            "individuals": doc["individuals"],
+            "properties": doc["properties"],
+            "classes": doc["classes"],
+        }
+        del shuffled["functionalProperties"]
+        shuffled["consistency"] = {
+            "functionalProperties": section["functionalProperties"],
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": section["disjointClasses"],
+        }
+        self.assertEqual(
+            OntologyEngine().diagnose(json.dumps(shuffled)).diagnostics,
+            first.diagnostics,
+        )
+
+    def test_diagnostics_copies_are_isolated(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        snapshot = report.diagnostics
+        mutated = report.diagnostics
+        mutated[0]["subject"] = "hacker"
+        mutated[0]["evidence"][0]["class"] = "Hack"
+        mutated[0]["evidence"][0]["source"]["kind"] = "made-up"
+        self.assertEqual(report.diagnostics, snapshot)
+        # 元组本身不可变
+        with self.assertRaises(TypeError):
+            report.diagnostics[0] = {}
+
+    def test_diagnose_accepts_bytes_and_reuses_parse_errors(self):
+        doc = make_doc()
+        # UTF-8 bytes 与 str 结果一致
+        self.assertEqual(
+            OntologyEngine().diagnose(json.dumps(doc).encode("utf-8")),
+            OntologyEngine().diagnose(json.dumps(doc)),
+        )
+
+        def parse_error(text):
+            with self.assertRaises(OntologyError) as ctx:
+                OntologyEngine().parse(text)
+            return str(ctx.exception)
+
+        def diagnose_error(text):
+            with self.assertRaises(OntologyError) as ctx:
+                OntologyEngine().diagnose(text)
+            return str(ctx.exception)
+
+        # 非 UTF-8、非法 JSON、错误类型与结构非法：diagnose 与 parse 抛出相同消息
+        self.assertEqual(diagnose_error(b"\xff\xfe{}"), parse_error(b"\xff\xfe{}"))
+        self.assertEqual(diagnose_error("{not json"), parse_error("{not json"))
+        self.assertEqual(diagnose_error(123), parse_error(123))
+        bad_shape = make_doc(triples=[{"subject": "alice", "predicate": "knows"}])
+        self.assertEqual(
+            diagnose_error(json.dumps(bad_shape)),
+            parse_error(json.dumps(bad_shape)),
+        )
+        bad_consistency = consistency_doc(
+            consistency={"classMembershipPredicate": "rdfType", "disjointClasses": []}
+        )
+        self.assertEqual(
+            diagnose_error(json.dumps(bad_consistency)),
+            parse_error(json.dumps(bad_consistency)),
+        )
+
+    def test_diagnose_does_not_change_model_outputs(self):
+        rule = {
+            "id": "knows-likes",
+            "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+        }
+        doc = make_doc(rules=[rule])
+        text = json.dumps(doc)
+        parsed = OntologyEngine().parse(text)
+        reported = OntologyEngine().diagnose(text).model
+        self.assertEqual(parsed.explicit_triples, reported.explicit_triples)
+        self.assertEqual(parsed.derived_triples, reported.derived_triples)
+        self.assertEqual(parsed.triples, reported.triples)
+        query = "SELECT ?x ?y WHERE { ?x knows ?y . OPTIONAL { ?x likes ?y } }"
+        self.assertEqual(parsed.query(query), reported.query(query))
+        self.assertEqual(
+            parsed.source_rule("alice", "likes", "bob"),
+            reported.source_rule("alice", "likes", "bob"),
+        )
+        self.assertEqual(
+            parsed.entails("alice", "likes", "bob"),
+            reported.entails("alice", "likes", "bob"),
+        )
+
+    def test_engine_call_still_aliases_parse(self):
+        doc = make_doc()
+        self.assertEqual(
+            OntologyEngine()(json.dumps(doc)).triples, parse(doc).triples
+        )
 
 
 if __name__ == "__main__":
