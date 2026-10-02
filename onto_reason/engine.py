@@ -152,7 +152,15 @@ class OntologyEngine:
             )
             if found:
                 conflicts = found
-        model = OntologyModel(explicit, derived, properties)
+        model = OntologyModel(
+            explicit,
+            derived,
+            properties,
+            rules=tuple(
+                (rule.rule_id, tuple(rule.if_patterns), tuple(rule.then_patterns))
+                for rule in rules
+            ),
+        )
         return model, conflicts
 
     # ---------- 解析与校验 ----------

@@ -2401,5 +2401,248 @@ class PropertyPathBackwardCompatTests(unittest.TestCase):
         )
 
 
+class ExplainTests(unittest.TestCase):
+    """OntologyModel.explain 的规则证明行为。"""
+
+    def test_explicit_fact_has_single_explicit_proof(self):
+        model = parse(make_doc())
+        (proof,) = model.explain("alice", "knows", "bob")
+        self.assertEqual(proof.kind, "explicit")
+        self.assertEqual(proof.triple, Triple("alice", "knows", "bob"))
+        self.assertIsInstance(proof.triple, Triple)
+        self.assertIsNone(proof.ruleId)
+        self.assertEqual(proof.premises, ())
+
+    def test_unentailed_triple_returns_empty_tuple(self):
+        model = parse(make_doc())
+        self.assertEqual(model.explain("alice", "likes", "bob"), ())
+        self.assertEqual(model.explain("nobody", "knows", "bob"), ())
+
+    def test_non_string_arguments_raise_with_position(self):
+        model = parse(make_doc())
+        for args, position in (
+            ((1, "knows", "bob"), "1"),
+            (("alice", 2, "bob"), "2"),
+            (("alice", "knows", None), "3"),
+        ):
+            with self.assertRaises(OntologyError) as ctx:
+                model.explain(*args)
+            self.assertIn(position, str(ctx.exception))
+
+    def test_rule_proof_traces_to_explicit_leaves_in_if_order(self):
+        rule = {
+            "id": "fof",
+            "if": [
+                {"subject": "?x", "predicate": "knows", "object": "?y"},
+                {"subject": "?y", "predicate": "knows", "object": "?z"},
+            ],
+            "then": [{"subject": "?x", "predicate": "friendOf", "object": "?z"}],
+        }
+        model = parse(make_doc(rules=[rule]))
+        (proof,) = model.explain("alice", "friendOf", "carol")
+        self.assertEqual(proof.kind, "rule")
+        self.assertEqual(proof.ruleId, "fof")
+        self.assertEqual(
+            [premise.triple for premise in proof.premises],
+            [Triple("alice", "knows", "bob"), Triple("bob", "knows", "carol")],
+        )
+        self.assertTrue(all(p.kind == "explicit" for p in proof.premises))
+
+    def test_multiple_rules_all_shortest_proofs_sorted(self):
+        rules = [
+            {
+                "id": name,
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+            }
+            for name in ("r2", "r1")
+        ]
+        model = parse(make_doc(rules=rules))
+        proofs = model.explain("alice", "likes", "bob")
+        self.assertEqual([p.ruleId for p in proofs], ["r1", "r2"])
+        # 重复调用返回内容相同的元组
+        self.assertEqual(model.explain("alice", "likes", "bob"), proofs)
+
+    def test_rule_id_keeps_original_type_and_string_sort_order(self):
+        rules = [
+            {
+                "id": rule_id,
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+            }
+            for rule_id in ("2", 10)
+        ]
+        model = parse(make_doc(rules=rules))
+        proofs = model.explain("alice", "likes", "bob")
+        self.assertEqual([p.ruleId for p in proofs], [10, "2"])
+        self.assertIsInstance(proofs[0].ruleId, int)
+
+    def test_explicit_wins_over_derivation(self):
+        rule = {
+            "id": "r1",
+            "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            "then": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+        }
+        model = parse(make_doc(rules=[rule]))
+        (proof,) = model.explain("alice", "knows", "bob")
+        self.assertEqual(proof.kind, "explicit")
+
+    def test_cyclic_rules_terminate_without_cyclic_proofs(self):
+        rules = [
+            {
+                "id": "p2q",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+            },
+            {
+                "id": "q2p",
+                "if": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            },
+        ]
+        model = parse(make_doc(rules=rules))
+        (proof,) = model.explain("alice", "likes", "bob")
+        self.assertEqual(proof.ruleId, "p2q")
+        self.assertEqual([p.kind for p in proof.premises], ["explicit"])
+
+    def test_multiple_then_patterns_all_kept(self):
+        rule = {
+            "id": "r",
+            "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            "then": [
+                {"subject": "?x", "predicate": "likes", "object": "?y"},
+                {"subject": "?x", "predicate": "friendOf", "object": "?y"},
+            ],
+        }
+        model = parse(make_doc(rules=[rule]))
+        self.assertEqual(len(model.explain("bob", "friendOf", "carol")), 1)
+        self.assertEqual(len(model.explain("bob", "likes", "carol")), 1)
+
+    def test_only_minimal_leaf_proofs_returned(self):
+        doc = {
+            "classes": [],
+            "properties": ["p", "q"],
+            "individuals": [],
+            "triples": [
+                {"subject": "a", "predicate": "p", "object": "b"},
+                {"subject": "b", "predicate": "p", "object": "c"},
+            ],
+            "rules": [
+                {
+                    "id": "short",
+                    "if": [{"subject": "?x", "predicate": "p", "object": "?y"}],
+                    "then": [{"subject": "?x", "predicate": "q", "object": "?y"}],
+                },
+                {
+                    "id": "long",
+                    "if": [
+                        {"subject": "?x", "predicate": "p", "object": "?y"},
+                        {"subject": "?y", "predicate": "q", "object": "?z"},
+                    ],
+                    "then": [{"subject": "?x", "predicate": "q", "object": "?z"}],
+                },
+            ],
+        }
+        model = parse(doc)
+        # a-q-c 只能经 long 推出（2 个显式叶子）；b-q-c 走 short（1 叶）
+        (proof,) = model.explain("a", "q", "c")
+        self.assertEqual(proof.ruleId, "long")
+        (direct,) = model.explain("b", "q", "c")
+        self.assertEqual(direct.ruleId, "short")
+        self.assertEqual([p.kind for p in direct.premises], ["explicit"])
+
+    def test_transitive_closure_yields_all_shortest_proofs(self):
+        doc = {
+            "classes": [],
+            "properties": ["k"],
+            "individuals": [],
+            "triples": [
+                {"subject": "a", "predicate": "k", "object": "b"},
+                {"subject": "b", "predicate": "k", "object": "c"},
+                {"subject": "c", "predicate": "k", "object": "d"},
+            ],
+            "rules": [
+                {
+                    "id": "t",
+                    "if": [
+                        {"subject": "?x", "predicate": "k", "object": "?y"},
+                        {"subject": "?y", "predicate": "k", "object": "?z"},
+                    ],
+                    "then": [{"subject": "?x", "predicate": "k", "object": "?z"}],
+                }
+            ],
+        }
+        model = parse(doc)
+        proofs = model.explain("a", "k", "d")
+        self.assertEqual(len(proofs), 2)
+        for proof in proofs:
+            leaves = []
+
+            def walk(node):
+                if node.kind == "explicit":
+                    leaves.append(node.triple)
+                for premise in node.premises:
+                    walk(premise)
+
+            walk(proof)
+            self.assertEqual(len(leaves), 3)
+        self.assertEqual(model.explain("a", "k", "d"), proofs)
+
+    def test_duplicate_then_patterns_deduped(self):
+        doc = {
+            "classes": [],
+            "properties": ["p", "q"],
+            "individuals": [],
+            "triples": [{"subject": "a", "predicate": "p", "object": "b"}],
+            "rules": [
+                {
+                    "id": "r",
+                    "if": [{"subject": "?x", "predicate": "p", "object": "?y"}],
+                    "then": [
+                        {"subject": "?x", "predicate": "q", "object": "?y"},
+                        {"subject": "?x", "predicate": "q", "object": "?y"},
+                    ],
+                }
+            ],
+        }
+        model = parse(doc)
+        self.assertEqual(len(model.explain("a", "q", "b")), 1)
+
+    def test_empty_if_ground_then_proof_has_no_premises(self):
+        rule = {
+            "id": "fact",
+            "if": [],
+            "then": [{"subject": "carol", "predicate": "likes", "object": "alice"}],
+        }
+        model = parse(make_doc(rules=[rule]))
+        (proof,) = model.explain("carol", "likes", "alice")
+        self.assertEqual(proof.kind, "rule")
+        self.assertEqual(proof.premises, ())
+
+    def test_proof_is_read_only_snapshot(self):
+        rule = {
+            "id": "r1",
+            "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+        }
+        model = parse(make_doc(rules=[rule]))
+        (proof,) = model.explain("alice", "likes", "bob")
+        self.assertIsInstance(proof.premises, tuple)
+        for attr, value in (
+            ("kind", "x"),
+            ("triple", None),
+            ("ruleId", "y"),
+            ("premises", ()),
+        ):
+            with self.assertRaises(AttributeError):
+                setattr(proof, attr, value)
+        # explain 不改变模型的其它读取结果
+        before = (model.explicit_triples, model.derived_triples, model.triples)
+        model.explain("alice", "likes", "bob")
+        self.assertEqual(
+            before, (model.explicit_triples, model.derived_triples, model.triples)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
