@@ -911,6 +911,364 @@ class OptionalFilterSyntaxErrorTests(unittest.TestCase):
         )
 
 
+def union_model():
+    """并集查询模型：knows 链 + 部分 likes；只有 carol 有 email。"""
+    doc = {
+        "classes": ["Person"],
+        "properties": ["knows", "likes", "email"],
+        "individuals": ["alice", "bob", "carol", "dave"],
+        "triples": [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+            {"subject": "carol", "predicate": "knows", "object": "dave"},
+            {"subject": "bob", "predicate": "likes", "object": "tennis"},
+            {"subject": "bob", "predicate": "likes", "object": "soccer"},
+            {"subject": "carol", "predicate": "likes", "object": "music"},
+            {"subject": "carol", "predicate": "email", "object": "c@example.com"},
+        ],
+        "rules": [],
+    }
+    return parse(doc)
+
+
+class UnionTests(unittest.TestCase):
+    def setUp(self):
+        self.model = union_model()
+
+    def test_basic_union_merges_branch_results(self):
+        result = self.model.query(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION { ?s likes ?o } }"
+        )
+        self.assertEqual(result.variables, ("?s", "?o"))
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "bob"),
+                ("bob", "carol"),
+                ("bob", "soccer"),
+                ("bob", "tennis"),
+                ("carol", "dave"),
+                ("carol", "music"),
+            ),
+        )
+
+    def test_spec_example_with_filter_after_union(self):
+        # FILTER 在所有分支合并完成后执行，可引用任一分支的变量
+        result = self.model.query(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION { ?s likes ?o }"
+            " FILTER (BOUND(?o)) }"
+        )
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "bob"),
+                ("bob", "carol"),
+                ("bob", "soccer"),
+                ("bob", "tennis"),
+                ("carol", "dave"),
+                ("carol", "music"),
+            ),
+        )
+
+    def test_chained_union_associates_left_to_right(self):
+        result = self.model.query(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION { ?s likes ?o }"
+            " UNION { ?s email ?o } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "bob"),
+                ("bob", "carol"),
+                ("bob", "soccer"),
+                ("bob", "tennis"),
+                ("carol", "c@example.com"),
+                ("carol", "dave"),
+                ("carol", "music"),
+            ),
+        )
+
+    def test_branch_with_multiple_patterns_and_dots(self):
+        result = self.model.query(
+            "SELECT ?s ?o WHERE { { ?s knows ?x . ?x likes ?o . }"
+            " UNION { ?s likes ?o } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "soccer"),
+                ("alice", "tennis"),
+                ("bob", "music"),
+                ("bob", "soccer"),
+                ("bob", "tennis"),
+                ("carol", "music"),
+            ),
+        )
+
+    def test_branch_without_match_falls_back_to_other_branch(self):
+        result = self.model.query(
+            "SELECT ?s ?o WHERE { { ?s email ?o } UNION { ?s likes ?o } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (
+                ("bob", "soccer"),
+                ("bob", "tennis"),
+                ("carol", "c@example.com"),
+                ("carol", "music"),
+            ),
+        )
+
+    def test_all_branches_without_match_returns_empty_rows(self):
+        result = self.model.query(
+            "SELECT ?s WHERE { { ?s knows ?s } UNION { ?s likes ?s } }"
+        )
+        self.assertEqual(result.variables, ("?s",))
+        self.assertEqual(result.rows, ())
+
+    def test_variable_bound_in_only_one_branch_stays_none_elsewhere(self):
+        result = self.model.query(
+            "SELECT ?s ?o ?e WHERE { { ?s knows ?o } UNION { ?s email ?e } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "bob", None),
+                ("bob", "carol", None),
+                ("carol", None, "c@example.com"),
+                ("carol", "dave", None),
+            ),
+        )
+
+    def test_shared_variable_must_agree_with_outer_binding(self):
+        # 前置 BGP 把 ?x 绑定为 carol 的知道者，分支解须与之一致才能合并
+        result = self.model.query(
+            "SELECT ?x ?o WHERE { ?x knows carol ."
+            " { ?x likes ?o } UNION { ?x knows ?o } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (("bob", "carol"), ("bob", "soccer"), ("bob", "tennis")),
+        )
+
+    def test_star_projection_covers_union_branches_in_order(self):
+        result = self.model.query(
+            "SELECT * WHERE { { ?s knows ?o } UNION { ?o likes ?s } }"
+        )
+        self.assertEqual(result.variables, ("?s", "?o"))
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "bob"),
+                ("bob", "carol"),
+                ("carol", "dave"),
+                ("music", "carol"),
+                ("soccer", "bob"),
+                ("tennis", "bob"),
+            ),
+        )
+
+    def test_union_combines_with_optional_and_filter(self):
+        # carol 有 email，OPTIONAL 绑定 ?e 后被 FILTER(!BOUND(?e)) 过滤
+        result = self.model.query(
+            "SELECT * WHERE { { ?s knows ?o } UNION { ?s likes ?o } ."
+            " OPTIONAL { ?s email ?e } FILTER(!BOUND(?e)) }"
+        )
+        self.assertEqual(result.variables, ("?s", "?o", "?e"))
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "bob", None),
+                ("bob", "carol", None),
+                ("bob", "soccer", None),
+                ("bob", "tennis", None),
+            ),
+        )
+
+    def test_union_with_derived_triples(self):
+        doc = make_doc(
+            rules=[
+                {
+                    "id": "r1",
+                    "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                    "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+                }
+            ]
+        )
+        model = parse(doc)
+        # likes 全部由规则推出，与显式 knows 取并集
+        result = model.query(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION { ?s likes ?o } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (("alice", "bob"), ("bob", "carol")),
+        )
+
+    def test_union_result_is_deduped_sorted_and_immutable(self):
+        result = self.model.query(
+            "SELECT ?o WHERE { { ?s knows ?o } UNION { ?s likes ?o } }"
+        )
+        self.assertEqual(
+            result.rows,
+            (("bob",), ("carol",), ("dave",), ("music",), ("soccer",), ("tennis",)),
+        )
+        self.assertIsInstance(result.rows, tuple)
+        self.assertIsInstance(result.rows[0], tuple)
+
+    def test_union_query_is_repeatable(self):
+        text = (
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION { ?s likes ?o } }"
+        )
+        self.assertEqual(self.model.query(text), self.model.query(text))
+
+    def test_union_query_does_not_mutate_model(self):
+        before = (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        )
+        self.model.query(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION { ?s likes ?o } }"
+        )
+        self.assertEqual(before[0], self.model.explicit_triples)
+        self.assertEqual(before[1], self.model.derived_triples)
+        self.assertEqual(before[2], self.model.triples)
+
+
+class UnionSyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.model = union_model()
+
+    def assertQueryError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(text)
+        message = str(ctx.exception)
+        self.assertTrue(
+            "字符位置" in message or "分支" in message or "模式" in message,
+            f"错误消息缺少字符位置或分支序号: {message}",
+        )
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+        return message
+
+    def test_adjacent_groups_without_union_rejected(self):
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } { ?s likes ?o } }",
+            "UNION",
+        )
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } }",
+            "UNION",
+        )
+
+    def test_union_missing_brace_group(self):
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION ?s likes ?o }",
+            "'{'",
+        )
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION",
+            "'{'",
+        )
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { UNION { ?s likes ?o } }",
+            "UNION",
+        )
+
+    def test_empty_branch_rejected(self):
+        msg = self.assertQueryError(
+            "SELECT ?s ?o WHERE { { } UNION { ?s likes ?o } }",
+            "分支 1",
+            "空",
+        )
+        self.assertIn("三元组模式", msg)
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } UNION { } }",
+            "分支 2",
+            "空",
+        )
+
+    def test_nested_union_rejected(self):
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE {"
+            " { ?s knows ?o . UNION { ?s likes ?o } } UNION { ?s likes ?o } }",
+            "分支 1",
+            "UNION",
+        )
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE {"
+            " { { ?s knows ?o } UNION { ?s likes ?o } } UNION { ?s likes ?o } }",
+            "分支 1",
+        )
+
+    def test_optional_or_filter_inside_branch_rejected(self):
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE {"
+            " { OPTIONAL { ?s knows ?o } } UNION { ?s likes ?o } }",
+            "分支 1",
+            "OPTIONAL",
+        )
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE {"
+            " { ?s knows ?o . FILTER(BOUND(?o)) } UNION { ?s likes ?o } }",
+            "分支 1",
+            "FILTER",
+        )
+
+    def test_branch_missing_closing_brace(self):
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s knows ?o . UNION { ?s likes ?o } }"
+        )
+
+    def test_projection_variable_must_appear_in_some_branch(self):
+        self.assertQueryError(
+            "SELECT ?s ?z WHERE { { ?s knows ?o } UNION { ?s likes ?o } }",
+            "?z",
+        )
+
+    def test_branch_triple_validation_matches_baseline(self):
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s ?p ?o } UNION { ?s likes ?o } }",
+            "谓语",
+        )
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s knows } UNION { ?s likes ?o } }",
+            "项数不足",
+        )
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s knows ?o likes ?x } UNION { ?s likes ?o } }",
+            "项数过多",
+        )
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { . } UNION { ?s likes ?o } }",
+            "'.'",
+        )
+
+    def test_lowercase_union_is_not_a_keyword(self):
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE { { ?s knows ?o } union { ?s likes ?o } }"
+        )
+
+    def test_union_group_inside_optional_rejected(self):
+        self.assertQueryError(
+            "SELECT ?s ?o WHERE {"
+            " OPTIONAL { { ?s knows ?o } UNION { ?s likes ?o } } }"
+        )
+
+    def test_union_keyword_as_constant_still_works(self):
+        # 模式中间（非子句边界）的 UNION 仍是普通常量名
+        doc = make_doc(
+            properties=["knows"],
+            triples=[{"subject": "alice", "predicate": "knows", "object": "UNION"}],
+        )
+        model = parse(doc)
+        self.assertEqual(
+            model.query("SELECT ?s WHERE { ?s knows UNION }").rows,
+            (("alice",),),
+        )
+
+
 class ConsistencyValidationTests(unittest.TestCase):
     """consistency 段结构/取值错误应抛 OntologyError 并定位字段。"""
 

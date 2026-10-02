@@ -1,4 +1,4 @@
-"""SPARQL 风格基本图模式（BGP）查询，支持 OPTIONAL 左连接与 FILTER 筛选。
+"""SPARQL 风格基本图模式（BGP）查询，支持 OPTIONAL 左连接、FILTER 筛选与 UNION 并集。
 
 支持的语法（关键字只接受大写）：
 
@@ -6,6 +6,8 @@
     模式 := 三元组模式
           | OPTIONAL { 三元组模式 ('.' 三元组模式)* '.'? }
           | FILTER ( 表达式 )
+          | '{' 三元组模式 ('.' 三元组模式)* '.'? '}'
+            (UNION '{' 三元组模式 ('.' 三元组模式)* '.'? '}')+
 
 - 变量：'?' 后跟至少一个 Unicode 字母、数字或下划线。
 - 常量：不含空白且不以 '?' 开头的名称；或双引号包裹的 JSON 字符串，
@@ -14,16 +16,22 @@
 - OPTIONAL 块内可含一个或多个三元组模式，不得嵌套；按左连接处理：
   块内存在匹配时用所有匹配扩展绑定，否则保留原绑定且块内新变量未绑定。
   多个 OPTIONAL 块按出现顺序依次处理。
+- UNION 连接 WHERE 主体内相邻的两个或多个花括号分支，连续 UNION 从左到右
+  结合；每个分支含一个或多个三元组模式，分支内不得再出现 UNION、OPTIONAL
+  或 FILTER，分支不得为空。求值时各分支分别从当前绑定独立生成解再取并集：
+  同名变量与既有绑定不一致的解被丢弃，仅在一分支绑定的变量随该分支保留，
+  最终仍未绑定的投影变量以 None 占位。某分支无匹配时仍采用其他分支的结果。
 - FILTER 表达式只支持：
   BOUND(?v)、!BOUND(?v)、?v = ?w、?v != ?w、
   字符串常量与变量或字符串常量的 = / != 比较；
   涉及未绑定变量的等值或不等值比较结果为假；多个 FILTER 按逻辑与过滤。
-- '*' 按模式（含 OPTIONAL 块内模式）从左到右首次出现的顺序投影全部变量；
-  投影变量未绑定时结果行中以 None 占位。
+  UNION 之后的 FILTER 在所有分支合并完成后执行，可引用任一分支的变量。
+- '*' 按模式（含 OPTIONAL 块与 UNION 分支内模式）从左到右首次出现的顺序
+  投影全部变量；投影变量未绑定时结果行中以 None 占位。
 
 查询在 OntologyModel.triples（显式 + 推理三元组）上做嵌套循环连接匹配，
 同一变量跨模式绑定同一字符串，一条事实可被多个模式复用。
-任何词法或语法错误都抛出带字符位置或模式序号的 OntologyError。
+任何词法或语法错误都抛出带字符位置或模式/分支序号的 OntologyError。
 """
 
 from __future__ import annotations
@@ -60,6 +68,7 @@ _LIT = "="
 _CLAUSE_BGP = "BGP"
 _CLAUSE_OPTIONAL = "OPTIONAL"
 _CLAUSE_FILTER = "FILTER"
+_CLAUSE_UNION = "UNION"
 
 # FILTER 表达式类型
 _EXPR_BOUND = "BOUND"
@@ -324,9 +333,10 @@ class _Parser:
     - (_CLAUSE_BGP, patterns, None)
     - (_CLAUSE_OPTIONAL, patterns, None)
     - (_CLAUSE_FILTER, None, 表达式元组)
+    - (_CLAUSE_UNION, branches, None)：branches 为分支模式列表的列表
     每个三元组模式为 ((种类, 值), (种类, 值), (种类, 值))，谓语恒为字面值。
-    模式序号在整个 WHERE 体内连续编号，BGP 与 OPTIONAL 中的三元组一并计数；
-    FILTER 不占用三元组序号。
+    模式序号在整个 WHERE 体内连续编号，BGP、OPTIONAL 与 UNION 分支中的
+    三元组一并计数；FILTER 不占用三元组序号。
     """
 
     def __init__(self, text: str, tokens: List[_Token]) -> None:
@@ -488,6 +498,25 @@ class _Parser:
                 clause_ok = True
                 continue
 
+            # UNION 选择分支：'{' 分支 '}' (UNION '{' 分支 '}')+，只在 WHERE 主体出现
+            if clause_ok and tok.kind == _TOK_LBRACE:
+                if optional:
+                    raise self._error(
+                        "OPTIONAL 块内只允许出现三元组模式，不得嵌套花括号组",
+                        tok.pos,
+                    )
+                clauses.append(self._parse_union_clause())
+                prev_dot = False
+                clause_ok = True
+                continue
+
+            # UNION 关键字两侧必须是相邻的独立花括号组
+            if clause_ok and tok.kind == _TOK_NAME and tok.value == "UNION":
+                raise self._error(
+                    "UNION 两侧必须是相邻的独立花括号组",
+                    tok.pos,
+                )
+
             if len(pending) == 3:
                 raise self._error(
                     f"三元组模式 {self._pattern_index} 项数过多："
@@ -535,6 +564,148 @@ class _Parser:
                 )
             patterns.extend(group)
         return (_CLAUSE_OPTIONAL, patterns, None)
+
+    def _parse_union_clause(self) -> tuple:
+        """解析 '{' 分支 '}' (UNION '{' 分支 '}')+，首个 '{' 为当前 token。
+
+        连续 UNION 从左到右结合；并集满足结合律，因此扁平化为一个子句，
+        分支按出现顺序编号（从 1 开始）用于错误定位。
+        """
+        branches: List[List[Tuple[Any, Any, Any]]] = []
+        while True:
+            index = len(branches) + 1
+            self._i += 1  # 消费分支的 '{'
+            branches.append(self._parse_union_branch(index))
+            if (
+                not self._eof()
+                and self._peek().kind == _TOK_NAME
+                and self._peek().value == "UNION"
+            ):
+                self._i += 1
+                if self._eof() or self._peek().kind != _TOK_LBRACE:
+                    raise self._error(
+                        f"UNION 后缺少左花括号 '{{'（分支 {index + 1}）",
+                        self._here_pos(),
+                    )
+                continue
+            break
+        if len(branches) < 2:
+            raise self._error(
+                "相邻花括号组之间缺少 UNION 关键字（分支 1）",
+                self._here_pos(),
+            )
+        return (_CLAUSE_UNION, branches, None)
+
+    def _parse_union_branch(self, index: int) -> List[Tuple[Any, Any, Any]]:
+        """解析 UNION 单个分支 '{' 之后直到匹配 '}' 的三元组模式（已消费 '}'）。
+
+        分支内只允许一个或多个三元组模式，不得嵌套 UNION、OPTIONAL 或
+        FILTER，也不得为空；模式之间与分支末尾沿用可选点号规则。
+        """
+        patterns: List[Tuple[Any, Any, Any]] = []
+        pending: List[Tuple[Any, Any, Any]] = []
+        prev_dot = False
+        lbrace_pos = self._tokens[self._i - 1].pos
+
+        def finish_pattern() -> None:
+            if len(pending) != 3:
+                pos = pending[-1][2] if pending else lbrace_pos
+                raise OntologyError(
+                    f"三元组模式 {self._pattern_index} 项数不足："
+                    f"需要主语、谓语、宾语三项（字符位置 {pos}）"
+                )
+            s, p, o = pending
+            if p[0] == _VAR:
+                raise OntologyError(
+                    f"三元组模式 {self._pattern_index} 的谓语不能是变量 {p[1]}"
+                    f"（字符位置 {p[2]}）"
+                )
+            patterns.append((s, p, o))
+            pending.clear()
+            self._pattern_index += 1
+
+        while True:
+            if self._eof():
+                raise self._error(
+                    f"UNION 分支 {index} 缺少右花括号 '}}'",
+                    len(self._text),
+                )
+            tok = self._peek()
+
+            if tok.kind == _TOK_RBRACE:
+                if pending:
+                    finish_pattern()
+                self._i += 1
+                break
+
+            if tok.kind == _TOK_DOT:
+                if pending:
+                    finish_pattern()
+                elif prev_dot or not patterns:
+                    raise self._error(
+                        "点号 '.' 只能出现在一条完整三元组模式或子句之后",
+                        tok.pos,
+                    )
+                prev_dot = True
+                self._i += 1
+                continue
+
+            # 分支边界（组首或点号之后）上的保留字与嵌套组一律拒绝
+            if not pending:
+                if tok.kind == _TOK_LBRACE:
+                    raise self._error(
+                        f"UNION 分支 {index} 内不得嵌套花括号组",
+                        tok.pos,
+                    )
+                if tok.kind == _TOK_NAME and tok.value == "UNION":
+                    raise self._error(
+                        f"UNION 分支 {index} 内不得嵌套 UNION",
+                        tok.pos,
+                    )
+                if (
+                    tok.kind == _TOK_NAME
+                    and tok.value == "OPTIONAL"
+                    and self._next_is(_TOK_LBRACE)
+                ):
+                    raise self._error(
+                        f"UNION 分支 {index} 内只允许出现三元组模式，不得使用 OPTIONAL",
+                        tok.pos,
+                    )
+                if (
+                    tok.kind == _TOK_NAME
+                    and tok.value == "FILTER"
+                    and self._next_is(_TOK_LPAREN)
+                ):
+                    raise self._error(
+                        f"UNION 分支 {index} 内只允许出现三元组模式，不得使用 FILTER",
+                        tok.pos,
+                    )
+
+            if len(pending) == 3:
+                raise self._error(
+                    f"三元组模式 {self._pattern_index} 项数过多："
+                    f"模式之间需要用 '.' 分隔",
+                    tok.pos,
+                )
+            if tok.kind == _TOK_VAR:
+                pending.append((_VAR, tok.value, tok.pos))
+            elif tok.kind in (_TOK_NAME, _TOK_STRING):
+                pending.append((_LIT, tok.value, tok.pos))
+            else:
+                raise self._error(
+                    f"三元组模式 {self._pattern_index} 中存在未知语句成分"
+                    f" {tok.value!r}",
+                    tok.pos,
+                )
+            prev_dot = False
+            self._i += 1
+
+        if not patterns:
+            raise OntologyError(
+                f"UNION 分支 {index} 为空：分支内没有三元组模式"
+                f"（字符位置 {lbrace_pos}）"
+            )
+        return patterns
 
     def _parse_filter_clause(self) -> tuple:
         """解析 FILTER ( 表达式 )，关键字为当前 token。"""
@@ -670,13 +841,10 @@ class _Parser:
 
     def _validate_projection(self, projection, clauses) -> None:
         used = set()
-        for kind, patterns, _ in clauses:
-            if kind == _CLAUSE_FILTER:
-                continue
-            for s, _p, o in patterns:
-                for item in (s, o):
-                    if item[0] == _VAR:
-                        used.add(item[1])
+        for s, _p, o in _all_patterns(clauses):
+            for item in (s, o):
+                if item[0] == _VAR:
+                    used.add(item[1])
         for name, pos in projection:
             if name not in used:
                 raise OntologyError(
@@ -694,12 +862,16 @@ def _compile_query(text) -> Tuple[Tuple[str, ...], List[tuple], bool]:
 
 
 def _all_patterns(clauses) -> List[Tuple[Any, Any, Any]]:
-    """按子句顺序取出全部三元组模式（含 OPTIONAL 块内模式）。"""
+    """按子句顺序取出全部三元组模式（含 OPTIONAL 块与 UNION 分支内模式）。"""
     patterns: List[Tuple[Any, Any, Any]] = []
     for kind, group, _ in clauses:
         if kind == _CLAUSE_FILTER:
             continue
-        patterns.extend(group)
+        if kind == _CLAUSE_UNION:
+            for branch in group:
+                patterns.extend(branch)
+        else:
+            patterns.extend(group)
     return patterns
 
 
@@ -789,6 +961,14 @@ def run_query(model, text) -> QueryResult:
                     # 无匹配：保留原绑定一次，块内新变量保持未绑定
                     joined.append(binding)
             bindings = joined
+        elif kind == _CLAUSE_UNION:
+            # 每个分支从当前绑定独立求值，结果取并集：同名变量与既有绑定
+            # 冲突时该分支匹配自然落空，仅一分支绑定的变量随该分支保留。
+            unioned: List[dict] = []
+            for binding in bindings:
+                for branch in patterns:
+                    unioned.extend(_match_patterns(facts, [dict(binding)], branch))
+            bindings = unioned
         else:
             bindings = _match_patterns(facts, bindings, patterns)
         if not bindings:
