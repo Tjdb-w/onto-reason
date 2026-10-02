@@ -73,3 +73,22 @@ SELECT (?变量 ... | *) WHERE {
   `{"kind": "derived", "ruleId": ...}`（推理事实，`ruleId` 为原始规则 id）。
 - `message` 与 `parse` 抛出的冲突行逐字一致，重复诊断同一输入得到相同报告。
 
+## 规则证明
+
+`OntologyModel.explain(subject, predicate, object_)` 接受三个名称字符串，
+返回该三元组全部最短证明组成的不可变 `Proof` 元组：
+
+- 显式事实返回恰一个 `kind == "explicit"` 的证明（`ruleId` 为 `None`、
+  `premises` 为空元组）；显式事实与推理结论重合时只返回显式证明。
+- 推理事实返回全部显式叶子数最少的完整证明（`kind == "rule"`）：
+  `ruleId` 保留原始字符串或整数，`premises` 按 if 模式的原顺序给出各前提
+  证明节点，可从根追到显式叶子。规则有多个 then 或不同替换能推出目标时
+  全部完整证明保留；规则成环时有限结束，不返回依赖循环的较长证明。
+- 未被蕴含的三元组返回空元组。
+
+多个最短证明按 kind、`ruleId` 的字符串形式、节点 triple 和 premises 顺序
+稳定排列，相同结构与来源的重复树去重。`Proof` 的 `kind`、`triple`、`ruleId`、
+`premises` 均为只读属性，`premises` 是不可变元组，重复调用 `explain` 返回
+内容相同的元组。`subject`、`predicate`、`object_` 任一不是字符串时抛出
+`OntologyError`，消息中指出参数位置。
+

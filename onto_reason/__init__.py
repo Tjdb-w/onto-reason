@@ -2,7 +2,7 @@
 
 from .engine import OntologyEngine
 from .errors import InconsistencyError, OntologyError
-from .model import DerivedTriple, OntologyModel, Triple
+from .model import DerivedTriple, OntologyModel, Proof, Triple
 from .query import QueryResult
 from .report import ValidationReport
 
@@ -13,6 +13,7 @@ __all__ = [
     "OntologyModel",
     "Triple",
     "DerivedTriple",
+    "Proof",
     "QueryResult",
     "ValidationReport",
 ]
