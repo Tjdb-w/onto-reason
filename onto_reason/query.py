@@ -1,4 +1,4 @@
-"""SPARQL 风格基本图模式（BGP）查询，支持 OPTIONAL 左连接与 FILTER 筛选。
+"""SPARQL 风格基本图模式（BGP）查询，支持 OPTIONAL 左连接、FILTER 筛选与 UNION 并集。
 
 支持的语法（关键字只接受大写）：
 
@@ -6,6 +6,7 @@
     模式 := 三元组模式
           | OPTIONAL { 三元组模式 ('.' 三元组模式)* '.'? }
           | FILTER ( 表达式 )
+          | { 分支 } UNION { 分支 } (UNION { 分支 })*
 
 - 变量：'?' 后跟至少一个 Unicode 字母、数字或下划线。
 - 常量：不含空白且不以 '?' 开头的名称；或双引号包裹的 JSON 字符串，
@@ -18,6 +19,12 @@
   BOUND(?v)、!BOUND(?v)、?v = ?w、?v != ?w、
   字符串常量与变量或字符串常量的 = / != 比较；
   涉及未绑定变量的等值或不等值比较结果为假；多个 FILTER 按逻辑与过滤。
+- UNION 只在 WHERE 主体内连接相邻的花括号分支，连续 UNION 从左到右结合；
+  每个分支含一个或多个三元组模式（点号规则与 WHERE 体一致），分支内不得
+  再出现 UNION、OPTIONAL 或 FILTER，分支不得为空。求值时各分支分别生成解
+  再合并：与外层绑定同名的变量取值必须一致，仅在一侧绑定的变量保留该绑定；
+  某分支无匹配时采用其余分支的结果，全部分支都无匹配时结果为空。
+  FILTER 在所有分支合并完成后执行，可引用任一分支产生的变量。
 - '*' 按模式（含 OPTIONAL 块内模式）从左到右首次出现的顺序投影全部变量；
   投影变量未绑定时结果行中以 None 占位。
 
@@ -60,6 +67,7 @@ _LIT = "="
 _CLAUSE_BGP = "BGP"
 _CLAUSE_OPTIONAL = "OPTIONAL"
 _CLAUSE_FILTER = "FILTER"
+_CLAUSE_UNION = "UNION"
 
 # FILTER 表达式类型
 _EXPR_BOUND = "BOUND"
@@ -324,9 +332,11 @@ class _Parser:
     - (_CLAUSE_BGP, patterns, None)
     - (_CLAUSE_OPTIONAL, patterns, None)
     - (_CLAUSE_FILTER, None, 表达式元组)
+    - (_CLAUSE_UNION, branches, None)：branches 为分支列表，
+      每个分支是一组三元组模式
     每个三元组模式为 ((种类, 值), (种类, 值), (种类, 值))，谓语恒为字面值。
-    模式序号在整个 WHERE 体内连续编号，BGP 与 OPTIONAL 中的三元组一并计数；
-    FILTER 不占用三元组序号。
+    模式序号在整个 WHERE 体内连续编号，BGP、OPTIONAL 与 UNION 分支中的
+    三元组一并计数；FILTER 不占用三元组序号。
     """
 
     def __init__(self, text: str, tokens: List[_Token]) -> None:
@@ -412,9 +422,16 @@ class _Parser:
             raise self._error("SELECT 后缺少投影变量或 '*'", self._here_pos())
         return names, False
 
-    def _parse_group_body(self, optional: bool) -> List[tuple]:
-        """解析 '{' 之后直到匹配 '}' 的模式组，返回子句列表（已消费 '}'）。"""
-        scope = "OPTIONAL 块" if optional else "WHERE 模式体"
+    def _parse_group_body(self, optional: bool, union_branch: bool = False, branch_no: int = 0) -> List[tuple]:
+        """解析 '{' 之后直到匹配 '}' 的模式组，返回子句列表（已消费 '}'）。
+
+        union_branch 为 True 时按 UNION 分支解析：只允许三元组模式，
+        不得再出现 UNION、OPTIONAL 或 FILTER；branch_no 为分支序号（从 1 起）。
+        """
+        if union_branch:
+            scope = f"UNION 第 {branch_no} 分支"
+        else:
+            scope = "OPTIONAL 块" if optional else "WHERE 模式体"
         clauses: List[tuple] = []
         pending: List[Tuple[Any, Any, Any]] = []
         # prev_dot：上一个 token 是否为点号（拒绝连续点号）；
@@ -466,6 +483,55 @@ class _Parser:
                 continue
 
             # 子句关键字只在模式边界成立；未跟起始符号的关键字按普通常量处理。
+            if union_branch:
+                # UNION 分支内只允许三元组模式
+                if tok.kind == _TOK_LBRACE:
+                    raise self._error(
+                        f"UNION 第 {branch_no} 分支内不得嵌套花括号组或 UNION",
+                        tok.pos,
+                    )
+                if clause_ok and tok.kind == _TOK_NAME and self._next_is(_TOK_LBRACE) and tok.value == "UNION":
+                    raise self._error(
+                        f"UNION 第 {branch_no} 分支内不得再嵌套 UNION",
+                        tok.pos,
+                    )
+                if clause_ok and tok.kind == _TOK_NAME and self._next_is(_TOK_LBRACE) and tok.value == "OPTIONAL":
+                    raise self._error(
+                        f"UNION 第 {branch_no} 分支内只允许三元组模式，不得使用 OPTIONAL",
+                        tok.pos,
+                    )
+                if clause_ok and tok.kind == _TOK_NAME and self._next_is(_TOK_LPAREN) and tok.value == "FILTER":
+                    raise self._error(
+                        f"UNION 第 {branch_no} 分支内只允许三元组模式，不得使用 FILTER",
+                        tok.pos,
+                    )
+
+            if not optional and not union_branch and clause_ok and tok.kind == _TOK_LBRACE:
+                # WHERE 主体内的花括号组：必须是 UNION 子句的左分支
+                clauses.append(self._parse_union_clause())
+                prev_dot = False
+                clause_ok = True
+                continue
+
+            if (
+                not optional
+                and not union_branch
+                and clause_ok
+                and tok.kind == _TOK_NAME
+                and tok.value == "UNION"
+                and self._next_is(_TOK_LBRACE)
+            ):
+                raise self._error(
+                    "UNION 两侧必须是独立的花括号组：左侧缺少 '{' 分组",
+                    tok.pos,
+                )
+
+            if optional and clause_ok and tok.kind == _TOK_NAME and tok.value == "UNION" and self._next_is(_TOK_LBRACE):
+                raise self._error(
+                    "OPTIONAL 块内只允许出现三元组模式，不得使用 UNION",
+                    tok.pos,
+                )
+
             if clause_ok and tok.kind == _TOK_NAME and tok.value == "OPTIONAL" and self._next_is(_TOK_LBRACE):
                 if optional:
                     raise self._error(
@@ -509,11 +575,61 @@ class _Parser:
             self._i += 1
 
         if not any(kind != _CLAUSE_FILTER for kind, _, _ in clauses):
+            if union_branch:
+                raise OntologyError(
+                    f"UNION 第 {branch_no} 分支为空或不含三元组模式"
+                    f"（字符位置 {lbrace_pos}）"
+                )
             raise OntologyError(
                 f"{'OPTIONAL' if optional else 'WHERE'} 花括号内的模式组为空"
                 f"（字符位置 {lbrace_pos}）"
             )
         return clauses
+
+    def _parse_union_clause(self) -> tuple:
+        """解析 '{ ... } (UNION { ... })+'，当前 token 为首个 '{'。"""
+        branches = [self._parse_union_branch(1)]
+        # 花括号组后必须紧跟 UNION，否则不是合法的 UNION 子句
+        if (
+            self._eof()
+            or self._peek().kind != _TOK_NAME
+            or self._peek().value != "UNION"
+        ):
+            raise self._error(
+                "花括号组后缺少 UNION 关键字：WHERE 内的花括号组必须构成"
+                " '{ ... } UNION { ... }'",
+                self._here_pos(),
+            )
+        branch_no = 1
+        while (
+            not self._eof()
+            and self._peek().kind == _TOK_NAME
+            and self._peek().value == "UNION"
+        ):
+            self._i += 1
+            if self._eof() or self._peek().kind != _TOK_LBRACE:
+                raise self._error(
+                    "UNION 后缺少左花括号 '{'：两侧必须是独立的花括号组",
+                    self._here_pos(),
+                )
+            branch_no += 1
+            branches.append(self._parse_union_branch(branch_no))
+        return (_CLAUSE_UNION, branches, None)
+
+    def _parse_union_branch(self, branch_no: int) -> list:
+        """解析 UNION 的单个分支 '{ ... }'，当前 token 为 '{'，返回三元组模式列表。"""
+        self._i += 1
+        inner = self._parse_group_body(
+            optional=False, union_branch=True, branch_no=branch_no
+        )
+        patterns: List[Tuple[Any, Any, Any]] = []
+        for kind, group, _ in inner:
+            if kind != _CLAUSE_BGP:  # pragma: no cover - 解析器已拒绝分支内子句
+                raise OntologyError(
+                    f"UNION 第 {branch_no} 分支内只允许出现三元组模式"
+                )
+            patterns.extend(group)
+        return patterns
 
     def _parse_optional_clause(self) -> tuple:
         """解析 OPTIONAL { ... }，关键字为当前 token。"""
@@ -670,13 +786,10 @@ class _Parser:
 
     def _validate_projection(self, projection, clauses) -> None:
         used = set()
-        for kind, patterns, _ in clauses:
-            if kind == _CLAUSE_FILTER:
-                continue
-            for s, _p, o in patterns:
-                for item in (s, o):
-                    if item[0] == _VAR:
-                        used.add(item[1])
+        for s, _p, o in _all_patterns(clauses):
+            for item in (s, o):
+                if item[0] == _VAR:
+                    used.add(item[1])
         for name, pos in projection:
             if name not in used:
                 raise OntologyError(
@@ -694,12 +807,16 @@ def _compile_query(text) -> Tuple[Tuple[str, ...], List[tuple], bool]:
 
 
 def _all_patterns(clauses) -> List[Tuple[Any, Any, Any]]:
-    """按子句顺序取出全部三元组模式（含 OPTIONAL 块内模式）。"""
+    """按子句顺序取出全部三元组模式（含 OPTIONAL 块与 UNION 分支内模式）。"""
     patterns: List[Tuple[Any, Any, Any]] = []
     for kind, group, _ in clauses:
         if kind == _CLAUSE_FILTER:
             continue
-        patterns.extend(group)
+        if kind == _CLAUSE_UNION:
+            for branch in group:
+                patterns.extend(branch)
+        else:
+            patterns.extend(group)
     return patterns
 
 
@@ -779,6 +896,15 @@ def run_query(model, text) -> QueryResult:
     for kind, patterns, expr in clauses:
         if kind == _CLAUSE_FILTER:
             bindings = [b for b in bindings if _eval_filter(expr, b)]
+        elif kind == _CLAUSE_UNION:
+            # 各分支分别从当前绑定出发生成解，再合并（并集）：
+            # 与外层绑定同名的变量由 _match_patterns 保证取值一致；
+            # 某分支无匹配时仅采用其余分支的结果。
+            joined: List[dict] = []
+            for binding in bindings:
+                for branch in patterns:
+                    joined.extend(_match_patterns(facts, [dict(binding)], branch))
+            bindings = joined
         elif kind == _CLAUSE_OPTIONAL:
             joined: List[dict] = []
             for binding in bindings:
