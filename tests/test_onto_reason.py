@@ -2028,5 +2028,378 @@ class DiagnoseApiTests(unittest.TestCase):
         )
 
 
+def path_model():
+    """属性路径模型：edge 链 a→b→c→d→b 成环；a --other--> x；b --label--> B。
+
+    'iso' 已声明为个体但从不出现在任何三元组中，用于验证 p?/p* 的零次分支
+    只覆盖实际出现过的节点。规则把每条 edge 推导为 invOnly，并由 other
+    推导出一条 edge（a→x），使推理事实也参与路径求值。
+    """
+    doc = {
+        "classes": ["Node"],
+        "properties": ["edge", "other", "label", "invOnly"],
+        "individuals": ["a", "b", "c", "d", "x", "iso"],
+        "triples": [
+            {"subject": "a", "predicate": "edge", "object": "b"},
+            {"subject": "b", "predicate": "edge", "object": "c"},
+            {"subject": "c", "predicate": "edge", "object": "d"},
+            {"subject": "d", "predicate": "edge", "object": "b"},
+            {"subject": "a", "predicate": "other", "object": "x"},
+            {"subject": "b", "predicate": "label", "object": "B"},
+        ],
+        "rules": [
+            {
+                "id": "copy-edge",
+                "if": [{"subject": "?s", "predicate": "edge", "object": "?o"}],
+                "then": [
+                    {"subject": "?s", "predicate": "invOnly", "object": "?o"}
+                ],
+            },
+            {
+                "id": "other-to-edge",
+                "if": [{"subject": "?s", "predicate": "other", "object": "?o"}],
+                "then": [{"subject": "?s", "predicate": "edge", "object": "?o"}],
+            },
+        ],
+    }
+    return parse(doc)
+
+
+class PropertyPathTests(unittest.TestCase):
+    def setUp(self):
+        self.model = path_model()
+
+    def assertRows(self, text, rows):
+        result = self.model.query(text)
+        self.assertEqual(result.rows, tuple(rows))
+        return result
+
+    def test_plain_name_is_one_edge_path(self):
+        self.assertRows(
+            "SELECT ?o WHERE { a edge ?o }",
+            [("b",), ("x",)],  # a→b 显式，a→x 由 other-to-edge 推出
+        )
+
+    def test_inverse_path_constant_endpoints(self):
+        # ?s ^edge b：沿 edge 指向 b 的节点只有 c；指向 a 的有 b 与 x
+        self.assertRows("SELECT ?s WHERE { ?s ^edge b }", [("c",)])
+        self.assertRows("SELECT ?s WHERE { ?s ^edge a }", [("b",), ("x",)])
+
+    def test_inverse_path_with_two_variables(self):
+        self.assertRows(
+            "SELECT ?s ?o WHERE { ?s ^edge ?o }",
+            [
+                ("b", "a"),
+                ("b", "d"),
+                ("c", "b"),
+                ("d", "c"),
+                ("x", "a"),
+            ],
+        )
+
+    def test_sequence_composition(self):
+        self.assertRows("SELECT ?o WHERE { a edge/edge ?o }", [("c",)])
+        self.assertRows("SELECT ?o WHERE { a edge/edge/edge ?o }", [("d",)])
+
+    def test_alternation_is_union(self):
+        self.assertRows(
+            "SELECT ?o WHERE { a edge|other ?o }", [("b",), ("x",)]
+        )
+
+    def test_grouping_parentheses(self):
+        # (edge|other)/label：a 经 edge 到 b、b 经 label 到 B
+        self.assertRows("SELECT ?o WHERE { a (edge|other)/label ?o }", [("B",)])
+        self.assertRows(
+            "SELECT ?o WHERE { b (edge/edge)|label ?o }", [("B",), ("d",)]
+        )
+
+    def test_zero_or_one_includes_identity(self):
+        result = self.assertRows(
+            "SELECT ?s ?o WHERE { ?s edge? ?o }",
+            [
+                ("B", "B"),
+                ("a", "a"),
+                ("a", "b"),
+                ("a", "x"),
+                ("b", "b"),
+                ("b", "c"),
+                ("c", "c"),
+                ("c", "d"),
+                ("d", "b"),
+                ("d", "d"),
+                ("x", "x"),
+            ],
+        )
+        # 零次分支只连接实际出现过的节点：iso 从未出现在三元组中
+        subjects = {row[0] for row in result.rows}
+        self.assertNotIn("iso", subjects)
+
+    def test_zero_or_more_reflexive_transitive_closure(self):
+        # a 经环可到 b,c,d，再由派生边到 x，并含自身 a；不到 B、不到 iso
+        self.assertRows(
+            "SELECT ?o WHERE { a edge* ?o }",
+            [("a",), ("b",), ("c",), ("d",), ("x",)],
+        )
+
+    def test_one_or_more_excludes_zero_step(self):
+        # a 无法经正数步回到自身（a 不在环上），故结果不含 a
+        self.assertRows(
+            "SELECT ?o WHERE { a edge+ ?o }",
+            [("b",), ("c",), ("d",), ("x",)],
+        )
+
+    def test_positive_closure_reaches_self_on_cycle(self):
+        # 环 b→c→d→b 上的节点经正数步回到自身；a、x、B 不在环上
+        self.assertRows(
+            "SELECT ?x WHERE { ?x edge+ ?x }", [("b",), ("c",), ("d",)]
+        )
+
+    def test_star_same_variable_binds_appearing_nodes_only(self):
+        result = self.model.query("SELECT ?x WHERE { ?x edge* ?x }")
+        self.assertEqual(
+            result.rows,
+            (("B",), ("a",), ("b",), ("c",), ("d",), ("x",)),
+        )
+
+    def test_star_closure_terminates_on_cycle(self):
+        # 重复执行且结果有限即说明环状数据上闭包终止
+        text = "SELECT ?s ?o WHERE { ?s edge* ?o }"
+        first = self.model.query(text)
+        self.assertEqual(first, self.model.query(text))
+        self.assertEqual(len(first.rows), len(set(first.rows)))
+
+    def test_inverse_uses_derived_facts(self):
+        # invOnly 全部为推理结论，逆向路径同样能命中
+        self.assertRows("SELECT ?s WHERE { ?s ^invOnly a }", [("b",), ("x",)])
+
+    def test_path_with_constant_subject_and_object(self):
+        self.assertRows("SELECT * WHERE { a edge/edge c }", [()])
+        self.assertEqual(len(self.model.query("SELECT * WHERE { a edge/edge x }")), 0)
+
+    def test_path_in_optional_left_join(self):
+        text = "SELECT ?x ?y WHERE { ?x edge b . OPTIONAL { ?x edge+ ?y } }"
+        result = self.model.query(text)
+        # ?x = a（a→b）与 d（d→b）；二者闭包沿环展开
+        self.assertEqual(result.variables, ("?x", "?y"))
+        self.assertEqual(
+            result.rows,
+            (
+                ("a", "b"),
+                ("a", "c"),
+                ("a", "d"),
+                ("a", "x"),
+                ("d", "b"),
+                ("d", "c"),
+                ("d", "d"),
+            ),
+        )
+        self.assertEqual(result, self.model.query(text))
+
+    def test_path_optional_no_match_keeps_none(self):
+        # x 是 a other x 的宾语，自身没有 edge 出边；经 ^other 取到 x 后
+        # OPTIONAL 的 edge+ 无匹配，?y 保持未绑定
+        result = self.model.query(
+            "SELECT ?x ?y WHERE { ?x ^other a . OPTIONAL { ?x edge+ ?y } }"
+        )
+        self.assertEqual(result.rows, (("x", None),))
+
+    def test_path_in_union_branches(self):
+        result = self.model.query(
+            "SELECT ?o WHERE { { a edge+ ?o } UNION { a other ?o } }"
+        )
+        self.assertEqual(result.rows, (("b",), ("c",), ("d",), ("x",)))
+
+    def test_filter_keeps_semantics_with_path_bound_variable(self):
+        result = self.model.query(
+            'SELECT ?o WHERE { a edge* ?o . FILTER(?o = "c") }'
+        )
+        self.assertEqual(result.rows, (("c",),))
+        result2 = self.model.query(
+            "SELECT ?o WHERE { a edge* ?o . FILTER(!BOUND(?o)) }"
+        )
+        self.assertEqual(result2.rows, ())
+
+    def test_star_projection_order_with_paths(self):
+        result = self.model.query(
+            "SELECT * WHERE { ?s edge/edge ?m . ?m ^edge ?t }"
+        )
+        self.assertEqual(result.variables, ("?s", "?m", "?t"))
+
+    def test_empty_result_keeps_projection_columns(self):
+        # label 只指向 B，而 B 没有任何 edge 出边，复合无匹配
+        result = self.model.query("SELECT ?x ?y WHERE { ?x label/edge ?y }")
+        self.assertEqual(result.variables, ("?x", "?y"))
+        self.assertEqual(result.rows, ())
+
+    def test_rows_deduped_sorted_none_first(self):
+        result = self.model.query(
+            "SELECT ?b ?l WHERE { ?a edge ?b . OPTIONAL { ?b label ?l } }"
+        )
+        # 先按投影首列 ?b 排序；只有 b 有 label B，c/d/x 的 ?l 为 None
+        self.assertEqual(
+            result.rows,
+            (("b", "B"), ("c", None), ("d", None), ("x", None)),
+        )
+
+    def test_path_query_repeatable_and_does_not_mutate(self):
+        text = "SELECT ?s ?o WHERE { ?s (edge|other)+ ?o }"
+        before = (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        )
+        first = self.model.query(text)
+        for _ in range(3):
+            self.assertEqual(self.model.query(text), first)
+        self.assertEqual(before, (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        ))
+
+    def test_whitespace_around_operators(self):
+        self.assertEqual(
+            self.model.query("SELECT ?o WHERE { a edge / edge ?o }").rows,
+            self.model.query("SELECT ?o WHERE { a edge/edge ?o }").rows,
+        )
+        self.assertEqual(
+            self.model.query("SELECT ?o WHERE { a ( edge | other ) ?o }").rows,
+            self.model.query("SELECT ?o WHERE { a edge|other ?o }").rows,
+        )
+        self.assertEqual(
+            self.model.query("SELECT ?o WHERE { a ^ edge ?o }").rows,
+            self.model.query("SELECT ?o WHERE { a ^edge ?o }").rows,
+        )
+
+
+class PropertyPathSyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.model = path_model()
+
+    def assertQueryError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(text)
+        message = str(ctx.exception)
+        self.assertTrue(
+            "字符位置" in message or "模式" in message,
+            f"错误消息缺少字符位置或模式序号: {message}",
+        )
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+        return message
+
+    def test_non_str_input_rejected(self):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(123)
+        self.assertIn("str", str(ctx.exception))
+
+    def test_variable_predicate_still_rejected(self):
+        self.assertQueryError(
+            "SELECT * WHERE { ?x ?p ?y }", "谓语", "模式 0"
+        )
+
+    def test_undeclared_property_in_path(self):
+        self.assertQueryError(
+            "SELECT ?y WHERE { a nope ?y }", "nope", "未声明", "模式 0"
+        )
+        self.assertQueryError(
+            "SELECT ?y WHERE { a edge/nope ?y }", "nope", "未声明"
+        )
+        self.assertQueryError(
+            "SELECT ?y WHERE { a (edge|nope) ?y }", "nope", "未声明"
+        )
+        self.assertQueryError(
+            "SELECT ?y WHERE { a ^nope ?y }", "nope", "未声明"
+        )
+
+    def test_missing_operand_after_operator(self):
+        self.assertQueryError("SELECT ?y WHERE { a edge/ ?y }", "/")
+        self.assertQueryError("SELECT ?y WHERE { a edge| ?y }", "|")
+        self.assertQueryError("SELECT ?y WHERE { a ^ ?y }", "^")
+        self.assertQueryError("SELECT ?y WHERE { a edge?/ ?y }", "/")
+
+    def test_missing_operand_before_operator(self):
+        self.assertQueryError("SELECT ?y WHERE { a /edge ?y }", "/")
+        self.assertQueryError("SELECT ?y WHERE { a |edge ?y }", "|")
+
+    def test_quantifier_without_atom(self):
+        self.assertQueryError("SELECT ?y WHERE { a * ?y }", "*")
+        self.assertQueryError("SELECT ?y WHERE { a + ?y }", "+")
+
+    def test_unbalanced_parentheses(self):
+        self.assertQueryError(
+            "SELECT ?y WHERE { a (edge/edge ?y }", "圆括号", "模式 0"
+        )
+        self.assertQueryError(
+            "SELECT ?y WHERE { a edge) ?y }", "项数过多"
+        )
+
+    def test_empty_parenthesized_group(self):
+        self.assertQueryError("SELECT ?y WHERE { a () ?y }", "圆括号")
+
+    def test_stacked_quantifiers_rejected(self):
+        self.assertQueryError("SELECT ?y WHERE { a edge** ?y }", "量词")
+        self.assertQueryError("SELECT ?y WHERE { a edge?+ ?y }", "量词")
+        self.assertQueryError("SELECT ?y WHERE { a edge++ ?y }", "量词")
+
+    def test_incomplete_path_at_end(self):
+        self.assertQueryError("SELECT ?y WHERE { a edge/", "/")
+        self.assertQueryError("SELECT ?y WHERE { a edge|", "|")
+
+    def test_path_inside_filter_is_not_expression(self):
+        # FILTER 不把路径当作比较操作数
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x edge b . FILTER(edge/edge = b) }",
+            "FILTER",
+        )
+
+
+class PropertyPathBackwardCompatTests(unittest.TestCase):
+    def test_subject_object_names_with_path_chars_stay_single(self):
+        doc = {
+            "classes": ["N"],
+            "properties": ["p"],
+            "individuals": ["x/y", "u+v", "w|z", "a^b"],
+            "triples": [
+                {"subject": "x/y", "predicate": "p", "object": "u+v"},
+                {"subject": "w|z", "predicate": "p", "object": "a^b"},
+            ],
+            "rules": [],
+        }
+        model = parse(doc)
+        self.assertEqual(
+            model.query("SELECT ?s ?o WHERE { ?s p ?o }").rows,
+            (("w|z", "a^b"), ("x/y", "u+v")),
+        )
+
+    def test_predicate_name_containing_path_chars_matches_as_constant(self):
+        doc = {
+            "classes": ["N"],
+            "properties": ["a/b", "x(y)"],
+            "individuals": ["s"],
+            "triples": [
+                {"subject": "s", "predicate": "a/b", "object": "o1"},
+                {"subject": "s", "predicate": "x(y)", "object": "o2"},
+            ],
+            "rules": [],
+        }
+        model = parse(doc)
+        self.assertEqual(
+            model.query("SELECT ?o WHERE { s a/b ?o }").rows, (("o1",),)
+        )
+        self.assertEqual(
+            model.query("SELECT ?o WHERE { s x(y) ?o }").rows, (("o2",),)
+        )
+
+    def test_glued_question_variable_object_is_legacy_lexing(self):
+        doc = make_doc()
+        model = parse(doc)
+        # p?y 旧词法：谓语 p（常量）+ 宾语变量 ?y，不是路径量词
+        self.assertEqual(
+            model.query("SELECT ?y WHERE { alice knows?y }").rows,
+            model.query("SELECT ?y WHERE { alice knows ?y }").rows,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

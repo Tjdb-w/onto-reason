@@ -87,12 +87,13 @@ class OntologyModel:
     - explicit_triples：显式三元组，按 (主语, 谓语, 宾语) 字典序排列。
     - derived_triples：推理结论，同样按字典序排列，每条带来源规则 id。
     - entails(s, p, o)：判断单条三元组是否被蕴含（显式或推理得出）。
+    - declared_properties：本体中已声明的属性名（查询谓语/属性路径据此校验）。
     所有读取接口均返回新对象，不改变模型内部数据。
     """
 
-    __slots__ = ("_explicit", "_derived", "_facts", "_source")
+    __slots__ = ("_explicit", "_derived", "_facts", "_source", "_properties")
 
-    def __init__(self, explicit, derived) -> None:
+    def __init__(self, explicit, derived, properties=frozenset()) -> None:
         # explicit / derived: dict[Triple, rule_id 或 None]
         self._explicit = frozenset(explicit)
         self._derived = frozenset(
@@ -100,6 +101,7 @@ class OntologyModel:
         )
         self._facts = frozenset(explicit) | frozenset(derived)
         self._source = dict(derived)
+        self._properties = frozenset(properties)
 
     @property
     def explicit_triples(self) -> Tuple[Triple, ...]:
@@ -115,6 +117,11 @@ class OntologyModel:
     def triples(self) -> Tuple[Triple, ...]:
         """全部三元组（显式 + 推理），按字典序稳定排列。"""
         return tuple(sorted(self._facts))
+
+    @property
+    def declared_properties(self) -> Tuple[str, ...]:
+        """本体中已声明的属性名，按字典序稳定排列。"""
+        return tuple(sorted(self._properties))
 
     def entails(self, subject: str, predicate: str, object_: str) -> bool:
         """判断 (subject, predicate, object_) 是否被当前模型蕴含。"""
@@ -132,6 +139,12 @@ class OntologyModel:
         FILTER ( 表达式 )（BOUND/!BOUND 与 =/!= 比较，多个 FILTER 逻辑与）
         以及 { ... } UNION { ... }（多个花括号分支取并集，分支内仅含三元组
         模式，连续 UNION 从左到右结合）。
+        谓语位置除常量属性名外还接受属性路径，只作用于本模型的
+        explicit + derived 三元组并集：^p 逆向、a/b 序列复合、a|b 取并集、
+        p?/p*/p+ 分别为零或一次/零或多次/一次或多次，圆括号只用于分组，
+        路径中的属性名必须已声明；p?/p* 的零次分支只连接三元组中实际出现
+        过的节点，p+ 在环状数据上也会有限结束。OPTIONAL 与 UNION 块内同样
+        可以使用属性路径；FILTER 不把路径当作比较操作数。
         查询不修改模型，重复执行结果一致。词法或语法错误抛出 OntologyError。
         """
         return run_query(self, text)
