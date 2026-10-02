@@ -109,7 +109,7 @@ class OntologyEngine:
         model, conflicts = self._build(text)
         if conflicts is not None:
             lines = [f"本体一致性诊断发现 {len(conflicts)} 处冲突："]
-            lines.extend(conflict["message"] for conflict in conflicts)
+            lines.extend(diagnostic["message"] for _, diagnostic, _ in conflicts)
             raise InconsistencyError("\n".join(lines))
         return model
 
@@ -124,7 +124,15 @@ class OntologyEngine:
         """
         model, conflicts = self._build(text)
         if conflicts is not None:
-            return ValidationReport(False, None, conflicts)
+            diagnostics = [diagnostic for _, diagnostic, _ in conflicts]
+            evidence_triples = tuple(pair for _, _, pair in conflicts)
+            return ValidationReport(
+                False,
+                None,
+                diagnostics,
+                _evidence_triples=evidence_triples,
+                _explanation_model=model,
+            )
         return ValidationReport(True, model, ())
 
     def __call__(self, text) -> OntologyModel:
@@ -545,7 +553,11 @@ class OntologyEngine:
         classes: frozenset,
         individuals: frozenset,
     ) -> List[dict]:
-        """收集全部两两冲突，按与 InconsistencyError 相同的顺序排列。"""
+        """收集全部两两冲突，按与 InconsistencyError 相同的顺序排列。
+
+        每个元素为 (排序键, 诊断字典, 证据三元组对)；证据三元组对按
+        evidence 的顺序给出参与冲突的两条事实，供证明追溯使用。
+        """
         # 全部事实的来源表：显式事实为 None，推理结论为来源规则 id。
         fact_source: Dict[Triple, Optional[object]] = {t: None for t in explicit}
         fact_source.update(derived)
@@ -553,10 +565,10 @@ class OntologyEngine:
         membership = self._membership_facts(
             fact_source, consistency.membership_predicate, classes, individuals
         )
-        # 各收集器返回 (排序键, 诊断字典) 元组列表。
+        # 各收集器返回 (排序键, 诊断字典, 证据三元组对) 元组列表。
         conflicts = []
         conflicts.extend(
-            self._disjoint_conflicts(membership, consistency.disjoint)
+            self._disjoint_conflicts(membership, consistency)
         )
         conflicts.extend(
             self._functional_conflicts(fact_source, consistency.functional)
@@ -566,7 +578,7 @@ class OntologyEngine:
 
         # 按约束 id 的字符串表示、冲突类型、subject、冲突条目字典序排列。
         conflicts.sort(key=lambda item: item[0])
-        return [diagnostic for _, diagnostic in conflicts]
+        return conflicts
 
     def _membership_facts(
         self,
@@ -587,9 +599,10 @@ class OntologyEngine:
             membership.setdefault((triple.subject, triple.object), source)
         return membership
 
-    def _disjoint_conflicts(self, membership, constraints):
+    def _disjoint_conflicts(self, membership, consistency: _Consistency):
+        predicate = consistency.membership_predicate
         conflicts = []
-        for constraint in constraints:
+        for constraint in consistency.disjoint:
             names = sorted(constraint.classes)
             holders: Dict[str, List[str]] = {}
             for subject, class_name in membership:
@@ -630,7 +643,11 @@ class OntologyEngine:
                             first,
                             second,
                         )
-                        conflicts.append((key, diagnostic))
+                        evidence_triples = (
+                            Triple(subject, predicate, first),
+                            Triple(subject, predicate, second),
+                        )
+                        conflicts.append((key, diagnostic, evidence_triples))
         return conflicts
 
     def _functional_conflicts(self, fact_source: Dict[Triple, Optional[object]], constraints):
@@ -678,7 +695,11 @@ class OntologyEngine:
                             first,
                             second,
                         )
-                        conflicts.append((key, diagnostic))
+                        evidence_triples = (
+                            Triple(subject, property_, first),
+                            Triple(subject, property_, second),
+                        )
+                        conflicts.append((key, diagnostic, evidence_triples))
         return conflicts
 
     @staticmethod
