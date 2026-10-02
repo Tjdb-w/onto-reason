@@ -152,7 +152,7 @@ class OntologyEngine:
             )
             if found:
                 conflicts = found
-        model = OntologyModel(explicit, derived)
+        model = OntologyModel(explicit, derived, properties)
         return model, conflicts
 
     # ---------- 解析与校验 ----------

@@ -1,4 +1,4 @@
-"""SPARQL 风格基本图模式（BGP）查询，支持 OPTIONAL 左连接、FILTER 筛选与 UNION 并集。
+"""SPARQL 风格基本图模式（BGP）查询，支持属性路径、OPTIONAL 左连接、FILTER 筛选与 UNION 并集。
 
 支持的语法（关键字只接受大写）：
 
@@ -12,7 +12,17 @@
 - 变量：'?' 后跟至少一个 Unicode 字母、数字或下划线。
 - 常量：不含空白且不以 '?' 开头的名称；或双引号包裹的 JSON 字符串，
   字符串解码后按完整字符串精确比较。
-- 三元组模式固定为主语、谓语、宾语三项；谓语必须是常量。
+- 三元组模式固定为主语、谓语、宾语三项；主语和宾语必须是常量或变量，
+  谓语必须是常量属性名或属性路径，不能是变量。
+- 属性路径只作用于谓语位置，由已声明属性名组成，支持：
+    ^p      逆向：沿 p 的反向边连接；
+    a/b     序列：先走 a 再走 b（关系复合）；
+    a|b     选择：a、b 任选一支（并集）；
+    p?      零次或一次；p* 零次或多次；p+ 一次或多次；
+    ( ... ) 圆括号仅用于分组；运算符两侧允许任意空白。
+  路径求值得到去重的节点对集合；p?/p* 的零次分支只连接当前模型全部
+  三元组中实际出现过的主语或宾语，不产生新术语绑定；p+ 在环状数据上
+  也会有限结束。路径同样可用于 OPTIONAL 块与 UNION 分支内。
 - OPTIONAL 块内可含一个或多个三元组模式，不得嵌套；按左连接处理：
   块内存在匹配时用所有匹配扩展绑定，否则保留原绑定且块内新变量未绑定。
   多个 OPTIONAL 块按出现顺序依次处理。
@@ -26,8 +36,9 @@
   字符串常量与变量或字符串常量的 = / != 比较；
   涉及未绑定变量的等值或不等值比较结果为假；多个 FILTER 按逻辑与过滤。
   UNION 之后的 FILTER 在所有分支合并完成后执行，可引用任一分支的变量。
-- '*' 按模式（含 OPTIONAL 块与 UNION 分支内模式）从左到右首次出现的顺序
-  投影全部变量；投影变量未绑定时结果行中以 None 占位。
+  属性路径不是比较表达式，FILTER 语义不因路径语法改变。
+- '*' 投影按模式（含 OPTIONAL 块与 UNION 分支内模式）从左到右首次出现的
+  顺序投影全部变量；投影变量未绑定时结果行中以 None 占位。
 
 查询在 OntologyModel.triples（显式 + 推理三元组）上做嵌套循环连接匹配，
 同一变量跨模式绑定同一字符串，一条事实可被多个模式复用。
@@ -37,7 +48,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .errors import OntologyError
 
@@ -54,11 +65,20 @@ _TOK_NE = "NE"
 _TOK_VAR = "VAR"
 _TOK_NAME = "NAME"
 _TOK_STRING = "STRING"
+# 仅在谓语路径位置识别的 token
+_TOK_CARET = "CARET"
+_TOK_PIPE = "PIPE"
+_TOK_SLASH = "SLASH"
+_TOK_QMARK = "QMARK"
+_TOK_PLUS = "PLUS"
 
 _DELIMITERS = frozenset('{}."?*')
 # FILTER 圆括号内额外识别为独立 token 的字符；括号外这些字符仍是名称的一部分，
 # 以保持不含 OPTIONAL/FILTER 的查询词法与旧行为完全一致。
 _FILTER_DELIMITERS = frozenset('()!=')
+# 谓语路径位置额外成为词法边界/运算符的字符；只在路径扫描模式下生效，
+# 主语、宾语位置的同名常量分词结果保持不变。
+_PATH_DELIMITERS = frozenset('^|?+/()')
 
 # 模式项：("?", 变量名) 或 ("=", 字面值)
 _VAR = "?"
@@ -75,6 +95,23 @@ _EXPR_BOUND = "BOUND"
 _EXPR_NOT_BOUND = "NOT_BOUND"
 _EXPR_EQ = "EQ"
 _EXPR_NE = "NE"
+
+# 谓语为属性路径时的标记；普通常量谓语仍为三元组 (_LIT, 名称, 位置)。
+_PRED_PATH = "PATH"
+# 路径 AST 节点（全部为不可变可哈希元组）：
+# ("N", 属性名, 起始位置) 属性叶子；("NS", 字符串常量, 起始位置) 字符串叶子
+# （只允许单独作为谓语，等价于旧的字符串常量谓语；嵌入复合路径时报错）；
+# ("I", 子节点) 逆向；("S", (子节点...)) 序列；("A", (子节点...)) 选择；
+# ("Q", 量词('?'/'*'/'+'), 子节点, 位置) 重复。
+_PATH_LEAF = "N"
+_PATH_STRLEAF = "NS"
+_PATH_INV = "I"
+_PATH_SEQ = "S"
+_PATH_ALT = "A"
+_PATH_QUANT = "Q"
+
+# 字符串常量单独作谓语时的内部标记（匹配行为与普通字面值一致）。
+_LIT_STR = "S="
 
 
 class QueryResult:
@@ -217,113 +254,214 @@ def _skip_string(text: str, start: int) -> int:
     return j
 
 
-def _tokenize(text: str) -> List[_Token]:
-    filter_spans = _find_filter_spans(text)
-    span_starts = {start for start, _ in filter_spans}
-    span_i = 0
+class _Scanner:
+    """按需产生 token 的扫描器。
 
-    def in_filter(pos: int) -> bool:
-        nonlocal span_i
-        while span_i < len(filter_spans) and pos > filter_spans[span_i][1]:
-            span_i += 1
-        return span_i < len(filter_spans) and filter_spans[span_i][0] <= pos <= filter_spans[span_i][1]
+    path_mode 只应在三元组模式的谓语槽位打开：此时 ^ | / ? * + ( ) 作为
+    属性路径运算符；其余位置的词法与历史实现逐字一致（这些字符在主语、
+    宾语位置仍可作为普通名称的组成部分）。
+    """
 
-    tokens: List[_Token] = []
-    n = len(text)
-    i = 0
-    while i < n:
+    __slots__ = (
+        "text", "n", "i", "filter_spans", "span_i", "path_mode",
+        "_span_starts", "_buffered", "_has_buffer", "_buf_span_i",
+        "_last_advanced_end",
+    )
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.n = len(text)
+        self.i = 0
+        self.filter_spans = _find_filter_spans(text)
+        self.span_i = 0
+        self.path_mode = False
+        self._span_starts = {start for start, _ in self.filter_spans}
+        self._buffered: Optional[_Token] = None
+        # None 缓冲表示尚未前瞻；_scan 在 EOF 也返回 None，因此另用标志区分。
+        self._has_buffer = False
+        # 前瞻 token 扫描前的 FILTER 区间指针，便于切换词法模式时回退重扫。
+        self._buf_span_i = 0
+        # 最近一次消费的 token 结束位置（用于判断两词之间是否有空白）。
+        self._last_advanced_end = 0
+
+    # ---------- 前瞻与消费 ----------
+
+    def set_path_mode(self, flag: bool) -> None:
+        """切换词法模式。
+
+        若已有按旧模式扫描的前瞻 token，则把扫描位置回退到该 token 起点，
+        下一次 peek 会按新模式重新分词，保证谓语槽位之外的词法结果不变。
+        """
+        if flag == self.path_mode:
+            return
+        self.path_mode = flag
+        if self._has_buffer:
+            self.i = self._buffered.pos
+            self.span_i = self._buf_span_i
+            self._buffered = None
+            self._has_buffer = False
+
+    def peek(self) -> Optional[_Token]:
+        if not self._has_buffer:
+            self._buf_span_i = self.span_i
+            self._buffered = self._scan()
+            self._has_buffer = True
+        return self._buffered
+
+    def advance(self) -> None:
+        if self._has_buffer and self._buffered is not None:
+            self._last_advanced_end = (
+                self._buffered.pos + len(self._buffered.value)
+            )
+        self._buffered = None
+        self._has_buffer = False
+
+    def second_token(self) -> Optional[_Token]:
+        """在当前位置之后再试探扫描一个 token（按非路径模式）。
+
+        用于识别 'OPTIONAL {'、'FILTER (' 这类双 token 关键字边界；
+        试探扫描后完整复位，不改变正式分词状态与前瞻缓冲。
+        """
+        saved_i = self.i
+        saved_span_i = self.span_i
+        saved_mode = self.path_mode
+        self.path_mode = False
+        nxt = self._scan()
+        self.i = saved_i
+        self.span_i = saved_span_i
+        self.path_mode = saved_mode
+        return nxt
+
+    # ---------- FILTER 区间判定 ----------
+
+    def _in_filter(self, pos: int) -> bool:
+        while self.span_i < len(self.filter_spans) and pos > self.filter_spans[self.span_i][1]:
+            self.span_i += 1
+        return (
+            self.span_i < len(self.filter_spans)
+            and self.filter_spans[self.span_i][0] <= pos <= self.filter_spans[self.span_i][1]
+        )
+
+    # ---------- 单 token 扫描 ----------
+
+    def _scan(self) -> Optional[_Token]:
+        text = self.text
+        n = self.n
+        while self.i < n and text[self.i].isspace():
+            self.i += 1
+        if self.i >= n:
+            return None
+        i = self.i
         ch = text[i]
-        if ch.isspace():
-            i += 1
-            continue
+
+        def emit(kind: str, value: str, length: int) -> _Token:
+            self.i = i + length
+            return _Token(kind, value, i)
+
         if ch == "{":
-            tokens.append(_Token(_TOK_LBRACE, ch, i))
-            i += 1
-            continue
+            return emit(_TOK_LBRACE, ch, 1)
         if ch == "}":
-            tokens.append(_Token(_TOK_RBRACE, ch, i))
-            i += 1
-            continue
+            return emit(_TOK_RBRACE, ch, 1)
         if ch == ".":
-            tokens.append(_Token(_TOK_DOT, ch, i))
-            i += 1
-            continue
+            return emit(_TOK_DOT, ch, 1)
+        # '*' 在任何位置都是独立 token：既用于 SELECT * 投影，也用于路径 p*。
         if ch == "*":
-            tokens.append(_Token(_TOK_STAR, ch, i))
-            i += 1
-            continue
-        if in_filter(i):
+            return emit(_TOK_STAR, ch, 1)
+        if ch == '"':
+            return self._scan_string(i)
+
+        # 谓语路径位置：^ | / ? + 与圆括号都是路径语法 token。
+        if self.path_mode:
+            if ch == "?":
+                # '?' 后紧跟变量字符时整体是变量词，独立的 '?' 才是零或
+                # 一次量词；与非路径位置对 '?' 的判定保持一致。
+                if i + 1 < n and _is_var_char(text[i + 1]):
+                    j = i + 1
+                    while j < n and _is_var_char(text[j]):
+                        j += 1
+                    self.i = j
+                    return _Token(_TOK_VAR, text[i:j], i)
+                return emit(_TOK_QMARK, ch, 1)
+            if ch == "^":
+                return emit(_TOK_CARET, ch, 1)
+            if ch == "|":
+                return emit(_TOK_PIPE, ch, 1)
+            if ch == "/":
+                return emit(_TOK_SLASH, ch, 1)
+            if ch == "+":
+                return emit(_TOK_PLUS, ch, 1)
             if ch == "(":
-                tokens.append(_Token(_TOK_LPAREN, ch, i))
-                i += 1
-                continue
+                return emit(_TOK_LPAREN, ch, 1)
             if ch == ")":
-                tokens.append(_Token(_TOK_RPAREN, ch, i))
-                i += 1
-                continue
+                return emit(_TOK_RPAREN, ch, 1)
+
+        if self._in_filter(i):
+            if ch == "(":
+                return emit(_TOK_LPAREN, ch, 1)
+            if ch == ")":
+                return emit(_TOK_RPAREN, ch, 1)
             if ch == "!":
                 if i + 1 < n and text[i + 1] == "=":
-                    tokens.append(_Token(_TOK_NE, "!=", i))
-                    i += 2
-                else:
-                    tokens.append(_Token(_TOK_BANG, "!", i))
-                    i += 1
-                continue
+                    return emit(_TOK_NE, "!=", 2)
+                return emit(_TOK_BANG, "!", 1)
             if ch == "=":
-                tokens.append(_Token(_TOK_EQ, "=", i))
-                i += 1
-                continue
+                return emit(_TOK_EQ, "=", 1)
+
         if ch == "?":
-            start = i
             j = i + 1
             while j < n and _is_var_char(text[j]):
                 j += 1
             if j == i + 1:
                 raise OntologyError(
                     f"词法错误：'?' 后必须至少跟随一个字母、数字或下划线"
-                    f"（字符位置 {start}）"
+                    f"（字符位置 {i}）"
                 )
-            tokens.append(_Token(_TOK_VAR, text[start:j], start))
-            i = j
-            continue
-        if ch == '"':
-            start = i
-            j = i + 1
-            while j < n:
-                if text[j] == "\\":
-                    j += 2
-                    continue
-                if text[j] == '"':
-                    break
-                j += 1
-            if j >= n:
-                raise OntologyError(f"词法错误：字符串未闭合（字符位置 {start}）")
-            raw = text[start : j + 1]
-            try:
-                value = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise OntologyError(
-                    f"词法错误：非法的 JSON 字符串（字符位置 {start}）：{exc.msg}"
-                ) from exc
-            if not isinstance(value, str):  # pragma: no cover - 双引号内容必为 JSON 字符串
-                raise OntologyError(
-                    f"词法错误：字符串常量必须解码为字符串（字符位置 {start}）"
-                )
-            tokens.append(_Token(_TOK_STRING, value, start))
-            i = j + 1
-            continue
-        # 普通名称：FILTER 区间内额外以 ()!= 为界，区间外它们仍是名称字符
-        delimiters = _DELIMITERS | _FILTER_DELIMITERS if in_filter(i) else _DELIMITERS
+            self.i = j
+            return _Token(_TOK_VAR, text[i:j], i)
+
+        # 普通名称：路径位置额外以路径运算符为界；
+        # FILTER 区间内额外以 ()!= 为界，其他位置它们仍是名称字符。
+        delimiters = _DELIMITERS
+        if self.path_mode:
+            delimiters = delimiters | _PATH_DELIMITERS
+        if self._in_filter(i):
+            delimiters = delimiters | _FILTER_DELIMITERS
         start = i
         j = i
         while j < n and not text[j].isspace() and text[j] not in delimiters:
             # 'FILTER(' 无空格时，左括号是独立区间起点，名称只取到 FILTER
-            if j > start and j in span_starts:
+            if not self.path_mode and j > start and j in self._span_starts:
                 break
             j += 1
-        tokens.append(_Token(_TOK_NAME, text[start:j], start))
-        i = j
-    return tokens
+        self.i = j
+        return _Token(_TOK_NAME, text[start:j], start)
+
+    def _scan_string(self, start: int) -> _Token:
+        text = self.text
+        n = self.n
+        j = start + 1
+        while j < n:
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == '"':
+                break
+            j += 1
+        if j >= n:
+            raise OntologyError(f"词法错误：字符串未闭合（字符位置 {start}）")
+        raw = text[start : j + 1]
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise OntologyError(
+                f"词法错误：非法的 JSON 字符串（字符位置 {start}）：{exc.msg}"
+            ) from exc
+        if not isinstance(value, str):  # pragma: no cover - 双引号内容必为 JSON 字符串
+            raise OntologyError(
+                f"词法错误：字符串常量必须解码为字符串（字符位置 {start}）"
+            )
+        self.i = j + 1
+        return _Token(_TOK_STRING, value, start)
 
 
 class _Parser:
@@ -334,54 +472,63 @@ class _Parser:
     - (_CLAUSE_OPTIONAL, patterns, None)
     - (_CLAUSE_FILTER, None, 表达式元组)
     - (_CLAUSE_UNION, branches, None)：branches 为分支模式列表的列表
-    每个三元组模式为 ((种类, 值), (种类, 值), (种类, 值))，谓语恒为字面值。
+    每个三元组模式为 (主语项, 谓语, 宾语项)：主语/宾语为 (种类, 值, 位置)，
+    谓语为常量字面值三元组 (_LIT, 属性名, 位置) 或 (_PRED_PATH, 路径 AST)。
     模式序号在整个 WHERE 体内连续编号，BGP、OPTIONAL 与 UNION 分支中的
     三元组一并计数；FILTER 不占用三元组序号。
     """
 
-    def __init__(self, text: str, tokens: List[_Token]) -> None:
+    def __init__(self, text: str, scanner: _Scanner) -> None:
         self._text = text
-        self._tokens = tokens
-        self._i = 0
+        self._sc = scanner
         # 三元组模式序号在整个 WHERE 体内连续编号（含 OPTIONAL 块内模式）
         self._pattern_index = 0
 
-    def _peek(self) -> _Token:
-        return self._tokens[self._i]
+    def _peek(self) -> Optional[_Token]:
+        return self._sc.peek()
 
     def _eof(self) -> bool:
-        return self._i >= len(self._tokens)
+        return self._sc.peek() is None
+
+    def _advance(self) -> None:
+        self._sc.advance()
 
     def _error(self, message: str, pos: int) -> "OntologyError":
         return OntologyError(f"{message}（字符位置 {pos}）")
 
     def _here_pos(self) -> int:
-        return self._peek().pos if not self._eof() else len(self._text)
+        tok = self._peek()
+        return tok.pos if tok is not None else len(self._text)
 
     def _next_is(self, kind: str) -> bool:
-        return self._i + 1 < len(self._tokens) and self._tokens[self._i + 1].kind == kind
+        if self._peek() is None:
+            return False
+        nxt = self._sc.second_token()
+        return nxt is not None and nxt.kind == kind
 
     def _expect_keyword(self, word: str) -> _Token:
-        if self._eof():
+        tok = self._peek()
+        if tok is None:
             pos = len(self._text)
             raise self._error(f"查询缺少关键字 {word}，或存在未知语句成分", pos)
-        tok = self._peek()
         if tok.kind != _TOK_NAME or tok.value != word:
             raise self._error(
                 f"查询缺少关键字 {word}，或存在未知语句成分 {tok.value!r}",
                 tok.pos,
             )
-        self._i += 1
+        self._advance()
         return tok
 
     def parse(self) -> Tuple[Tuple[str, ...], List[tuple], bool]:
         self._expect_keyword("SELECT")
         projection, star = self._parse_projection()
         self._expect_keyword("WHERE")
-        if self._eof() or self._peek().kind != _TOK_LBRACE:
+        tok = self._peek()
+        if tok is None or tok.kind != _TOK_LBRACE:
             raise self._error("WHERE 后缺少左花括号 '{'", self._here_pos())
-        self._i += 1
-        clauses = self._parse_group_body(optional=False)
+        lbrace_pos = tok.pos
+        self._advance()
+        clauses = self._parse_group_body(optional=False, lbrace_pos=lbrace_pos)
         # _parse_group_body 已消费右花括号
         if not self._eof():
             tok = self._peek()
@@ -390,19 +537,24 @@ class _Parser:
         return tuple(name for name, _ in projection), clauses, star
 
     def _parse_projection(self) -> Tuple[List[Tuple[str, int]], bool]:
-        if self._eof():
+        self._sc.set_path_mode(False)
+        tok = self._peek()
+        if tok is None:
             raise self._error("SELECT 后缺少投影变量或 '*'", len(self._text))
-        if self._peek().kind == _TOK_STAR:
-            self._i += 1
+        if tok.kind == _TOK_STAR:
+            self._advance()
             # '*' 后必须紧跟 WHERE
-            if self._eof() or self._peek().kind != _TOK_NAME or self._peek().value != "WHERE":
+            nxt = self._peek()
+            if nxt is None or nxt.kind != _TOK_NAME or nxt.value != "WHERE":
                 raise self._error("'*' 与 WHERE 之间存在未知语句成分", self._here_pos())
             return [], True
 
         names: List[Tuple[str, int]] = []
         seen = set()
-        while not self._eof():
+        while True:
             tok = self._peek()
+            if tok is None:
+                break
             if tok.kind == _TOK_NAME and tok.value == "WHERE":
                 break
             if tok.kind != _TOK_VAR:
@@ -417,12 +569,28 @@ class _Parser:
                 )
             seen.add(tok.value)
             names.append((tok.value, tok.pos))
-            self._i += 1
+            self._advance()
         if not names:
             raise self._error("SELECT 后缺少投影变量或 '*'", self._here_pos())
         return names, False
 
-    def _parse_group_body(self, optional: bool) -> List[tuple]:
+    def _read_subject_or_object(self) -> Tuple[Any, Any, Any]:
+        """读取主语/宾语槽位的一个词（调用时已是非路径扫描模式）。"""
+        tok = self._peek()
+        if tok.kind == _TOK_VAR:
+            term = (_VAR, tok.value, tok.pos)
+        elif tok.kind in (_TOK_NAME, _TOK_STRING):
+            term = (_LIT, tok.value, tok.pos)
+        else:
+            raise self._error(
+                f"三元组模式 {self._pattern_index} 中存在未知语句成分"
+                f" {tok.value!r}",
+                tok.pos,
+            )
+        self._advance()
+        return term
+
+    def _parse_group_body(self, optional: bool, lbrace_pos: int) -> List[tuple]:
         """解析 '{' 之后直到匹配 '}' 的模式组，返回子句列表（已消费 '}'）。"""
         scope = "OPTIONAL 块" if optional else "WHERE 模式体"
         clauses: List[tuple] = []
@@ -432,7 +600,6 @@ class _Parser:
         # （组首、点号之后或前一子句之后）。
         prev_dot = False
         clause_ok = True
-        lbrace_pos = self._tokens[self._i - 1].pos
 
         def finish_pattern() -> None:
             if len(pending) != 3:
@@ -442,7 +609,7 @@ class _Parser:
                     f"需要主语、谓语、宾语三项（字符位置 {pos}）"
                 )
             s, p, o = pending
-            if p[0] == _VAR:
+            if len(p) == 3 and p[0] == _VAR:
                 raise OntologyError(
                     f"三元组模式 {self._pattern_index} 的谓语不能是变量 {p[1]}"
                     f"（字符位置 {p[2]}）"
@@ -452,14 +619,16 @@ class _Parser:
             self._pattern_index += 1
 
         while True:
-            if self._eof():
-                raise self._error(f"{scope}缺少右花括号 '}}'", len(self._text))
+            # 谓语槽位（pending 恰有一项）才打开路径扫描模式。
+            self._sc.set_path_mode(len(pending) == 1)
             tok = self._peek()
+            if tok is None:
+                raise self._error(f"{scope}缺少右花括号 '}}'", len(self._text))
 
             if tok.kind == _TOK_RBRACE:
                 if pending:
                     finish_pattern()
-                self._i += 1
+                self._advance()
                 break
 
             if tok.kind == _TOK_DOT:
@@ -472,7 +641,7 @@ class _Parser:
                     )
                 prev_dot = True
                 clause_ok = True
-                self._i += 1
+                self._advance()
                 continue
 
             # 子句关键字只在模式边界成立；未跟起始符号的关键字按普通常量处理。
@@ -523,19 +692,18 @@ class _Parser:
                     f"模式之间需要用 '.' 分隔",
                     tok.pos,
                 )
-            if tok.kind == _TOK_VAR:
-                pending.append((_VAR, tok.value, tok.pos))
-            elif tok.kind in (_TOK_NAME, _TOK_STRING):
-                pending.append((_LIT, tok.value, tok.pos))
-            else:
-                raise self._error(
-                    f"三元组模式 {self._pattern_index} 中存在未知语句成分"
-                    f" {tok.value!r}",
-                    tok.pos,
-                )
+
+            if len(pending) == 1:
+                # 谓语：常量属性名或属性路径，在此整体消费。
+                pending.append(self._parse_predicate())
+                prev_dot = False
+                clause_ok = False
+                continue
+
+            # 主语或宾语槽位
+            pending.append(self._read_subject_or_object())
             prev_dot = False
             clause_ok = False
-            self._i += 1
 
         if not any(kind != _CLAUSE_FILTER for kind, _, _ in clauses):
             raise OntologyError(
@@ -547,14 +715,16 @@ class _Parser:
     def _parse_optional_clause(self) -> tuple:
         """解析 OPTIONAL { ... }，关键字为当前 token。"""
         kw = self._peek()
-        self._i += 1
-        if self._eof() or self._peek().kind != _TOK_LBRACE:
+        self._advance()
+        tok = self._peek()
+        if tok is None or tok.kind != _TOK_LBRACE:
             raise self._error(
                 "OPTIONAL 后缺少左花括号 '{'",
                 self._here_pos(),
             )
-        self._i += 1
-        inner = self._parse_group_body(optional=True)
+        lbrace_pos = tok.pos
+        self._advance()
+        inner = self._parse_group_body(optional=True, lbrace_pos=lbrace_pos)
         patterns: List[Tuple[Any, Any, Any]] = []
         for kind, group, _ in inner:
             if kind != _CLAUSE_BGP:  # pragma: no cover - 解析器已拒绝嵌套分组
@@ -574,15 +744,14 @@ class _Parser:
         branches: List[List[Tuple[Any, Any, Any]]] = []
         while True:
             index = len(branches) + 1
-            self._i += 1  # 消费分支的 '{'
-            branches.append(self._parse_union_branch(index))
-            if (
-                not self._eof()
-                and self._peek().kind == _TOK_NAME
-                and self._peek().value == "UNION"
-            ):
-                self._i += 1
-                if self._eof() or self._peek().kind != _TOK_LBRACE:
+            lbrace = self._peek()
+            self._advance()  # 消费分支的 '{'
+            branches.append(self._parse_union_branch(index, lbrace.pos))
+            tok = self._peek()
+            if tok is not None and tok.kind == _TOK_NAME and tok.value == "UNION":
+                self._advance()
+                nxt = self._peek()
+                if nxt is None or nxt.kind != _TOK_LBRACE:
                     raise self._error(
                         f"UNION 后缺少左花括号 '{{'（分支 {index + 1}）",
                         self._here_pos(),
@@ -596,7 +765,7 @@ class _Parser:
             )
         return (_CLAUSE_UNION, branches, None)
 
-    def _parse_union_branch(self, index: int) -> List[Tuple[Any, Any, Any]]:
+    def _parse_union_branch(self, index: int, lbrace_pos: int) -> List[Tuple[Any, Any, Any]]:
         """解析 UNION 单个分支 '{' 之后直到匹配 '}' 的三元组模式（已消费 '}'）。
 
         分支内只允许一个或多个三元组模式，不得嵌套 UNION、OPTIONAL 或
@@ -605,7 +774,6 @@ class _Parser:
         patterns: List[Tuple[Any, Any, Any]] = []
         pending: List[Tuple[Any, Any, Any]] = []
         prev_dot = False
-        lbrace_pos = self._tokens[self._i - 1].pos
 
         def finish_pattern() -> None:
             if len(pending) != 3:
@@ -615,7 +783,7 @@ class _Parser:
                     f"需要主语、谓语、宾语三项（字符位置 {pos}）"
                 )
             s, p, o = pending
-            if p[0] == _VAR:
+            if len(p) == 3 and p[0] == _VAR:
                 raise OntologyError(
                     f"三元组模式 {self._pattern_index} 的谓语不能是变量 {p[1]}"
                     f"（字符位置 {p[2]}）"
@@ -625,17 +793,18 @@ class _Parser:
             self._pattern_index += 1
 
         while True:
-            if self._eof():
+            self._sc.set_path_mode(len(pending) == 1)
+            tok = self._peek()
+            if tok is None:
                 raise self._error(
                     f"UNION 分支 {index} 缺少右花括号 '}}'",
                     len(self._text),
                 )
-            tok = self._peek()
 
             if tok.kind == _TOK_RBRACE:
                 if pending:
                     finish_pattern()
-                self._i += 1
+                self._advance()
                 break
 
             if tok.kind == _TOK_DOT:
@@ -647,7 +816,7 @@ class _Parser:
                         tok.pos,
                     )
                 prev_dot = True
-                self._i += 1
+                self._advance()
                 continue
 
             # 分支边界（组首或点号之后）上的保留字与嵌套组一律拒绝
@@ -687,18 +856,14 @@ class _Parser:
                     f"模式之间需要用 '.' 分隔",
                     tok.pos,
                 )
-            if tok.kind == _TOK_VAR:
-                pending.append((_VAR, tok.value, tok.pos))
-            elif tok.kind in (_TOK_NAME, _TOK_STRING):
-                pending.append((_LIT, tok.value, tok.pos))
-            else:
-                raise self._error(
-                    f"三元组模式 {self._pattern_index} 中存在未知语句成分"
-                    f" {tok.value!r}",
-                    tok.pos,
-                )
+
+            if len(pending) == 1:
+                pending.append(self._parse_predicate())
+                prev_dot = False
+                continue
+
+            pending.append(self._read_subject_or_object())
             prev_dot = False
-            self._i += 1
 
         if not patterns:
             raise OntologyError(
@@ -707,55 +872,264 @@ class _Parser:
             )
         return patterns
 
+    # ---------- 属性路径解析（谓语槽位，扫描器处于路径模式） ----------
+
+    def _parse_predicate(self) -> tuple:
+        """解析整个谓语：裸属性名降级为旧的字面值三元组，否则包装为路径。
+
+        单独的变量词（?p）不当场报错，而是作为普通项保留，由模式结束时的
+        校验按旧顺序先查项数再报“谓语不能是变量”。
+
+        '|'、'/' 与 '?'/'*'/'+' 量词总会延续路径（运算符两侧允许空白），
+        缺操作数等问题在路径递归解析处报错；路径主体结束后，只有 '^'、
+        '('、')' 可能与宾语常量开头冲突——它们与上一个词直接相邻时判为
+        不支持的路径写法，有空白分隔时谓语结束、符号交还宾语词法。
+        """
+        first = self._peek()
+        if first is not None and first.kind == _TOK_VAR:
+            self._advance()
+            tail = self._peek()
+            if (
+                tail is not None
+                and tail.kind in (_TOK_CARET, _TOK_LPAREN, _TOK_RPAREN)
+                and tail.pos == self._sc._last_advanced_end
+            ):
+                raise self._error(
+                    f"不支持的属性路径写法：谓语不能是变量 {first.value}"
+                    f"后再接路径运算符 {tail.value!r}",
+                    tail.pos,
+                )
+            return (_VAR, first.value, first.pos)
+        node = self._parse_path_alternative()
+        # 字符串常量只有在整个谓语就是它一个时才合法（沿用旧的字符串常量
+        # 谓语语义）；一旦嵌入复合路径（如 "p"/q、^"p"、("p")*），即属
+        # 不支持的路径写法，在该字符串位置报错。
+        if node[0] == _PATH_STRLEAF:
+            return (_LIT_STR, node[1], node[2])
+        for inner in _iter_path_nodes(node):
+            if inner[0] == _PATH_STRLEAF:
+                raise self._error(
+                    "不支持的属性路径写法：路径只能由属性名组成，"
+                    "字符串常量不能作为路径成员",
+                    inner[2],
+                )
+        tail = self._peek()
+        if (
+            tail is not None
+            and tail.kind in (_TOK_CARET, _TOK_LPAREN, _TOK_RPAREN)
+            and tail.pos == self._sc._last_advanced_end
+        ):
+            if tail.kind == _TOK_RPAREN:
+                raise self._error(
+                    "属性路径括号不配对：出现了没有对应左圆括号的 ')'",
+                    tail.pos,
+                )
+            if tail.kind == _TOK_CARET:
+                raise self._error(
+                    "不支持的属性路径写法：'^' 只能位于属性名或圆括号分组之前",
+                    tail.pos,
+                )
+            raise self._error(
+                "不支持的属性路径写法：属性名与圆括号分组之间缺少序列运算符 '/'",
+                tail.pos,
+            )
+        if node[0] == _PATH_LEAF:
+            return (_LIT, node[1], node[2])
+        return (_PRED_PATH, node)
+
+
+    def _parse_path_alternative(self) -> tuple:
+        """path := sequence ('|' sequence)*，'|' 从左到右扁平结合。"""
+        node = self._parse_path_sequence()
+        while True:
+            tok = self._peek()
+            if tok is None or tok.kind != _TOK_PIPE:
+                return node
+            self._advance()
+            right = self._parse_path_sequence()
+            if node[0] == _PATH_ALT:
+                node = (_PATH_ALT, node[1] + (right,))
+            else:
+                node = (_PATH_ALT, (node, right))
+
+    def _parse_path_sequence(self) -> tuple:
+        """sequence := step ('/' step)*，'/' 优先级高于 '|'。"""
+        node = self._parse_path_step()
+        while True:
+            tok = self._peek()
+            if tok is None or tok.kind != _TOK_SLASH:
+                return node
+            self._advance()
+            right = self._parse_path_step()
+            if node[0] == _PATH_SEQ:
+                node = (_PATH_SEQ, node[1] + (right,))
+            else:
+                node = (_PATH_SEQ, (node, right))
+
+    def _parse_path_step(self) -> tuple:
+        """step := '^'? primary ('?' | '*' | '+')?。
+
+        与 SPARQL 一致，量词绑定到主元素：^p* 解释为 ^(p*)。
+        """
+        tok = self._peek()
+        inverse = False
+        inv_pos = -1
+        if tok is not None and tok.kind == _TOK_CARET:
+            inverse = True
+            inv_pos = tok.pos
+            self._advance()
+            nxt = self._peek()
+            if nxt is None or nxt.kind not in (
+                _TOK_NAME, _TOK_STRING, _TOK_LPAREN
+            ):
+                raise self._error(
+                    "属性路径运算符 '^' 后缺少属性名或圆括号分组",
+                    inv_pos,
+                )
+        node = self._parse_path_primary()
+        quant_tok = self._peek()
+        if quant_tok is not None and quant_tok.kind in (_TOK_QMARK, _TOK_STAR, _TOK_PLUS):
+            quant = quant_tok.value
+            qpos = quant_tok.pos
+            self._advance()
+            doubled = self._peek()
+            if doubled is not None and doubled.kind in (_TOK_QMARK, _TOK_STAR, _TOK_PLUS):
+                raise self._error(
+                    f"不支持的属性路径写法：量词 {quant!r} 后不能再跟量词"
+                    f" {doubled.value!r}",
+                    doubled.pos,
+                )
+            node = (_PATH_QUANT, quant, node, qpos)
+        if inverse:
+            node = (_PATH_INV, node, inv_pos)
+        return node
+
+    def _parse_path_primary(self) -> tuple:
+        """primary := 属性名 | JSON 字符串常量 | '(' path ')'。"""
+        tok = self._peek()
+        if tok is None:
+            raise self._error(
+                "属性路径运算符后缺少操作数：需要已声明属性名或圆括号分组",
+                len(self._text),
+            )
+        if tok.kind == _TOK_NAME:
+            self._advance()
+            return (_PATH_LEAF, tok.value, tok.pos)
+        if tok.kind == _TOK_STRING:
+            self._advance()
+            return (_PATH_STRLEAF, tok.value, tok.pos)
+        if tok.kind == _TOK_VAR:
+            # 变量只有在整个谓语就是单个变量时才允许进入并由模式结束校验
+            # 报错；一旦出现在路径运算符之后，属于缺操作数/路径里混入变量。
+            raise OntologyError(
+                f"属性路径中不能出现变量 {tok.value}：谓语只能由已声明属性名"
+                f"组成（字符位置 {tok.pos}）"
+            )
+        if tok.kind == _TOK_QMARK:
+            # 独立的 '?' 量词没有操作数：不支持的路径写法。
+            raise self._error(
+                "属性路径量词 '?' 前缺少属性名或圆括号分组",
+                tok.pos,
+            )
+        if tok.kind == _TOK_STAR:
+            raise self._error(
+                "属性路径量词 '*' 前缺少属性名或圆括号分组",
+                tok.pos,
+            )
+        if tok.kind == _TOK_LPAREN:
+            lparen_pos = tok.pos
+            self._advance()
+            nxt = self._peek()
+            if nxt is not None and nxt.kind == _TOK_RPAREN:
+                raise self._error(
+                    "不支持的属性路径写法：圆括号分组内不能为空",
+                    lparen_pos,
+                )
+            node = self._parse_path_alternative()
+            closing = self._peek()
+            if closing is None or closing.kind != _TOK_RPAREN:
+                raise self._error(
+                    "属性路径缺少右圆括号 ')'，圆括号只用于路径分组",
+                    self._here_pos() if closing is None else closing.pos,
+                )
+            self._advance()
+            return node
+        if tok.kind in (_TOK_PIPE, _TOK_SLASH, _TOK_PLUS):
+            raise self._error(
+                f"属性路径运算符 {tok.value!r} 前缺少操作数（属性名或圆括号分组）",
+                tok.pos,
+            )
+        if tok.kind == _TOK_CARET:
+            raise self._error(
+                "属性路径运算符 '^' 后缺少属性名或圆括号分组（不能连续出现 '^'）",
+                tok.pos,
+            )
+        if tok.kind == _TOK_RPAREN:
+            raise self._error(
+                "属性路径括号不配对：出现了没有对应左圆括号的 ')'",
+                tok.pos,
+            )
+        if tok.kind in (_TOK_RBRACE, _TOK_DOT):
+            raise self._error(
+                "属性路径运算符后缺少操作数：需要已声明属性名或圆括号分组",
+                tok.pos,
+            )
+        raise self._error(
+            f"三元组模式 {self._pattern_index} 的谓语位置存在未知语句成分"
+            f" {tok.value!r}",
+            tok.pos,
+        )
+
     def _parse_filter_clause(self) -> tuple:
         """解析 FILTER ( 表达式 )，关键字为当前 token。"""
-        self._i += 1
-        if self._eof() or self._peek().kind != _TOK_LPAREN:
+        self._sc.set_path_mode(False)
+        self._advance()
+        tok = self._peek()
+        if tok is None or tok.kind != _TOK_LPAREN:
             raise self._error(
                 "FILTER 后缺少左圆括号 '('",
                 self._here_pos(),
             )
-        lparen = self._peek()
-        self._i += 1
+        lparen = tok
+        self._advance()
         expr = self._parse_filter_expr(lparen.pos)
-        if self._eof() or self._peek().kind != _TOK_RPAREN:
+        tok = self._peek()
+        if tok is None or tok.kind != _TOK_RPAREN:
             raise self._error(
                 "FILTER 表达式缺少右圆括号 ')'",
                 self._here_pos(),
             )
-        self._i += 1
+        self._advance()
         return (_CLAUSE_FILTER, None, expr)
 
     def _parse_filter_expr(self, lparen_pos: int) -> tuple:
         """解析圆括号内的单个表达式，'(' 与 ')' 已由调用方消费。"""
-        if self._eof():
+        self._sc.set_path_mode(False)
+        tok = self._peek()
+        if tok is None:
             raise OntologyError(
                 f"FILTER 表达式为空（字符位置 {lparen_pos}）"
             )
-        tok = self._peek()
 
         # !BOUND(?v)
         if tok.kind == _TOK_BANG:
             bang = tok
-            self._i += 1
-            if (
-                self._eof()
-                or self._peek().kind != _TOK_NAME
-                or self._peek().value != "BOUND"
-            ):
+            self._advance()
+            nxt = self._peek()
+            if nxt is None or nxt.kind != _TOK_NAME or nxt.value != "BOUND":
                 raise self._error(
                     "FILTER 中 '!' 后只允许 BOUND(?v) 形式",
                     bang.pos,
                 )
-            bound_tok = self._peek()
-            self._i += 1
+            bound_tok = nxt
+            self._advance()
             var_tok = self._expect_bound_variable(bound_tok.pos)
             self._expect_expr_end(bound_tok.pos)
             return (_EXPR_NOT_BOUND, var_tok.value)
 
         # BOUND(?v)
         if tok.kind == _TOK_NAME and tok.value == "BOUND":
-            self._i += 1
+            self._advance()
             var_tok = self._expect_bound_variable(tok.pos)
             self._expect_expr_end(tok.pos)
             return (_EXPR_BOUND, var_tok.value)
@@ -763,31 +1137,31 @@ class _Parser:
         # 左操作数：变量或字符串常量（普通名称不是合法表达式）
         if tok.kind == _TOK_VAR:
             left = (_VAR, tok.value, tok.pos)
-            self._i += 1
+            self._advance()
         elif tok.kind == _TOK_STRING:
             left = (_LIT, tok.value, tok.pos)
-            self._i += 1
+            self._advance()
         else:
             raise self._error(
                 f"未知 FILTER 表达式形式：{tok.value!r} 不是合法的表达式开头",
                 tok.pos,
             )
 
-        if self._eof() or self._peek().kind not in (_TOK_EQ, _TOK_NE):
+        op_tok = self._peek()
+        if op_tok is None or op_tok.kind not in (_TOK_EQ, _TOK_NE):
             raise self._error(
                 "FILTER 比较表达式需要 '=' 或 '!=' 运算符",
                 self._here_pos(),
             )
-        op_tok = self._peek()
-        self._i += 1
+        self._advance()
 
-        if self._eof():
+        right_tok = self._peek()
+        if right_tok is None:
             raise self._error(
                 f"FILTER 表达式在运算符 {op_tok.value!r} 后缺少右操作数"
                 f"（字符位置 {op_tok.pos}）",
                 op_tok.pos,
             )
-        right_tok = self._peek()
         if right_tok.kind == _TOK_VAR:
             right = (_VAR, right_tok.value, right_tok.pos)
         elif right_tok.kind == _TOK_STRING:
@@ -798,41 +1172,44 @@ class _Parser:
                 f"遇到 {right_tok.value!r}",
                 right_tok.pos,
             )
-        self._i += 1
+        self._advance()
         self._expect_expr_end(right_tok.pos)
         kind = _EXPR_EQ if op_tok.kind == _TOK_EQ else _EXPR_NE
         return (kind, left, right)
 
     def _expect_bound_variable(self, bound_pos: int) -> _Token:
         """消费 BOUND 后面的 '(' 变量 ')'，返回变量 token。"""
-        if self._eof() or self._peek().kind != _TOK_LPAREN:
+        tok = self._peek()
+        if tok is None or tok.kind != _TOK_LPAREN:
             raise self._error(
                 "BOUND 后缺少左圆括号 '('",
                 self._here_pos(),
             )
-        self._i += 1
-        if self._eof() or self._peek().kind != _TOK_VAR:
+        self._advance()
+        tok = self._peek()
+        if tok is None or tok.kind != _TOK_VAR:
             raise self._error(
                 "BOUND(...) 中必须且只能出现一个变量",
                 self._here_pos(),
             )
-        var_tok = self._peek()
-        self._i += 1
-        if self._eof() or self._peek().kind != _TOK_RPAREN:
+        var_tok = tok
+        self._advance()
+        tok = self._peek()
+        if tok is None or tok.kind != _TOK_RPAREN:
             raise self._error(
                 f"BOUND({var_tok.value} 后缺少右圆括号 ')'",
                 self._here_pos(),
             )
-        self._i += 1
+        self._advance()
         return var_tok
 
     def _expect_expr_end(self, anchor_pos: int) -> None:
         """表达式解析后，下一个 token 必须是外层 FILTER 的右圆括号。"""
-        if self._eof():
+        tok = self._peek()
+        if tok is None:
             raise OntologyError(
                 f"FILTER 表达式不完整，缺少右圆括号 ')'（字符位置 {anchor_pos}）"
             )
-        tok = self._peek()
         if tok.kind != _TOK_RPAREN:
             raise self._error(
                 f"未知 FILTER 表达式形式：{tok.value!r} 之后存在多余成分",
@@ -857,8 +1234,8 @@ def _compile_query(text) -> Tuple[Tuple[str, ...], List[tuple], bool]:
         raise OntologyError(
             f"查询文本必须是 str 类型，收到 {type(text).__name__}"
         )
-    tokens = _tokenize(text)
-    return _Parser(text, tokens).parse()
+    scanner = _Scanner(text)
+    return _Parser(text, scanner).parse()
 
 
 def _all_patterns(clauses) -> List[Tuple[Any, Any, Any]]:
@@ -876,22 +1253,149 @@ def _all_patterns(clauses) -> List[Tuple[Any, Any, Any]]:
 
 
 def _star_variables(clauses) -> Tuple[str, ...]:
-    """按模式从左到右、首次出现的顺序收集全部变量（谓语必为常量）。"""
+    """按模式从左到右、首次出现的顺序收集全部变量（谓语恒为常量或路径）。"""
     order: List[str] = []
     seen = set()
     for s, p, o in _all_patterns(clauses):
-        for item in (s, p, o):
+        # 谓语不含变量；仅主语、宾语可能引入新变量。
+        for item in (s, o):
             if item[0] == _VAR and item[1] not in seen:
                 seen.add(item[1])
                 order.append(item[1])
     return tuple(order)
 
 
-def _match_patterns(facts, bindings: List[dict], patterns) -> List[dict]:
+def _iter_path_nodes(node: tuple):
+    """深度优先遍历路径 AST，产出全部节点（含叶子）。"""
+    yield node
+    tag = node[0]
+    if tag in (_PATH_LEAF, _PATH_STRLEAF):
+        return
+    if tag == _PATH_QUANT:
+        yield from _iter_path_nodes(node[2])
+    else:
+        for child in node[1] if tag != _PATH_INV else (node[1],):
+            yield from _iter_path_nodes(child)
+
+
+def _validate_paths(clauses, declared: frozenset) -> None:
+    """谓语中的属性名（含裸常量谓语与路径叶子）必须是已声明属性。"""
+    for _s, p, _o in _all_patterns(clauses):
+        if len(p) == 2 and p[0] == _PRED_PATH:
+            for node in _iter_path_nodes(p[1]):
+                if node[0] != _PATH_LEAF:
+                    continue
+                name, pos = node[1], node[2]
+                if name not in declared:
+                    raise OntologyError(
+                        f"属性路径引用了未声明的属性 {name!r}"
+                        f"（谓语位置，字符位置 {pos}）"
+                    )
+        elif len(p) == 3 and p[0] == _LIT and p[1] not in declared:
+            raise OntologyError(
+                f"谓语引用了未声明的属性 {p[1]!r}"
+                f"（谓语位置，字符位置 {p[2]}）"
+            )
+        # _LIT_STR（字符串常量单独作谓语）沿用旧行为：按字符串值匹配，
+        # 不做已声明属性校验，匹配不到时返回空结果。
+
+
+class _PathEngine:
+    """在模型全部三元组（显式 + 推理）上把属性路径求值为去重节点对集合。"""
+
+    __slots__ = ("_by_predicate", "_universe", "_cache")
+
+    def __init__(self, facts) -> None:
+        by_predicate: Dict[str, set] = {}
+        universe = set()
+        for fact in facts:
+            by_predicate.setdefault(fact.predicate, set()).add(
+                (fact.subject, fact.object)
+            )
+            universe.add(fact.subject)
+            universe.add(fact.object)
+        self._by_predicate = by_predicate
+        self._universe = frozenset(universe)
+        self._cache: Dict[tuple, frozenset] = {}
+
+    def evaluate(self, node: tuple) -> frozenset:
+        cached = self._cache.get(node)
+        if cached is not None:
+            return cached
+        tag = node[0]
+        if tag == _PATH_LEAF:
+            result = frozenset(self._by_predicate.get(node[1], frozenset()))
+        elif tag == _PATH_INV:
+            result = frozenset((b, a) for a, b in self.evaluate(node[1]))
+        elif tag == _PATH_SEQ:
+            result = self._evaluate_sequence(node[1])
+        elif tag == _PATH_ALT:
+            merged: set = set()
+            for child in node[1]:
+                merged.update(self.evaluate(child))
+            result = frozenset(merged)
+        else:  # _PATH_QUANT
+            result = self._evaluate_quant(node[1], node[2])
+        self._cache[node] = result
+        return result
+
+    def _evaluate_sequence(self, children) -> frozenset:
+        pairs = self.evaluate(children[0])
+        for child in children[1:]:
+            pairs = self._compose(pairs, self.evaluate(child))
+        return pairs
+
+    def _evaluate_quant(self, quant: str, child: tuple) -> frozenset:
+        identity = frozenset((node, node) for node in self._universe)
+        base = self.evaluate(child)
+        if quant == "?":
+            return base | identity
+        # p+：在子路径出边邻接表上做宽度优先扩张，每轮只保留新增节点对；
+        # 邻接表只构建一次，节点集合有限，环状数据上也必然到达不动点。
+        adjacency: Dict[str, list] = {}
+        for mid, tail in base:
+            adjacency.setdefault(mid, []).append(tail)
+        reach: set = set(base)
+        frontier = set(base)
+        while frontier:
+            nxt: set = set()
+            for head, mid in frontier:
+                for tail in adjacency.get(mid, ()):
+                    pair = (head, tail)
+                    if pair not in reach:
+                        reach.add(pair)
+                        nxt.add(pair)
+            frontier = nxt
+        if quant == "*":
+            return frozenset(reach) | identity
+        return frozenset(reach)
+
+    @staticmethod
+    def _compose(left: frozenset, right: frozenset) -> frozenset:
+        index: Dict[str, list] = {}
+        for mid, tail in right:
+            index.setdefault(mid, []).append(tail)
+        out: set = set()
+        for head, mid in left:
+            for tail in index.get(mid, ()):
+                out.add((head, tail))
+        return frozenset(out)
+
+
+def _match_patterns(facts, bindings: List[dict], patterns, path_engine) -> List[dict]:
     """对一组三元组模式按序做内连接，返回所有扩展后的绑定。"""
     for s, p, o in patterns:
+        path = len(p) == 2 and p[0] == _PRED_PATH
+        pairs = path_engine.evaluate(p[1]) if path else None
         next_bindings: List[dict] = []
         for binding in bindings:
+            if path:
+                iterable = pairs
+                for fact_subject, fact_object in iterable:
+                    extended = _extend_path_binding(binding, s, o, fact_subject, fact_object)
+                    if extended is not None:
+                        next_bindings.append(extended)
+                continue
             for fact in facts:  # 同一事实可被多个模式复用
                 if fact.predicate != p[1]:
                     continue
@@ -916,6 +1420,27 @@ def _match_patterns(facts, bindings: List[dict], patterns) -> List[dict]:
         if not bindings:
             break
     return bindings
+
+
+def _extend_path_binding(binding: dict, s, o, fact_subject: str, fact_object: str):
+    """路径节点对上的单条匹配；与既有绑定冲突时返回 None。"""
+    if s[0] == _VAR:
+        if s[1] in binding and fact_subject != binding[s[1]]:
+            return None
+    elif fact_subject != s[1]:
+        return None
+    extended = dict(binding)
+    if s[0] == _VAR:
+        extended[s[1]] = fact_subject
+    # 同一模式内主语/宾语可能是同一变量（如 ?x p+ ?x）
+    if o[0] == _VAR:
+        if o[1] in extended and fact_object != extended[o[1]]:
+            return None
+    elif fact_object != o[1]:
+        return None
+    if o[0] == _VAR:
+        extended[o[1]] = fact_object
+    return extended
 
 
 def _eval_filter(expr: tuple, binding: dict) -> bool:
@@ -943,10 +1468,12 @@ def _eval_filter(expr: tuple, binding: dict) -> bool:
 def run_query(model, text) -> QueryResult:
     """在 model.triples 上执行查询，返回去重并按字典序排序后的 QueryResult。"""
     projection, clauses, star = _compile_query(text)
+    _validate_paths(clauses, frozenset(model.properties))
     if star:
         projection = _star_variables(clauses)
 
     facts = model.triples
+    path_engine = _PathEngine(facts)
     bindings: List[dict] = [{}]
     for kind, patterns, expr in clauses:
         if kind == _CLAUSE_FILTER:
@@ -954,7 +1481,9 @@ def run_query(model, text) -> QueryResult:
         elif kind == _CLAUSE_OPTIONAL:
             joined: List[dict] = []
             for binding in bindings:
-                matches = _match_patterns(facts, [dict(binding)], patterns)
+                matches = _match_patterns(
+                    facts, [dict(binding)], patterns, path_engine
+                )
                 if matches:
                     joined.extend(matches)
                 else:
@@ -967,10 +1496,14 @@ def run_query(model, text) -> QueryResult:
             unioned: List[dict] = []
             for binding in bindings:
                 for branch in patterns:
-                    unioned.extend(_match_patterns(facts, [dict(binding)], branch))
+                    unioned.extend(
+                        _match_patterns(
+                            facts, [dict(binding)], branch, path_engine
+                        )
+                    )
             bindings = unioned
         else:
-            bindings = _match_patterns(facts, bindings, patterns)
+            bindings = _match_patterns(facts, bindings, patterns, path_engine)
         if not bindings:
             break
 

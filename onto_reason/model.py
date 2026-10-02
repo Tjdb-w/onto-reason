@@ -90,9 +90,9 @@ class OntologyModel:
     所有读取接口均返回新对象，不改变模型内部数据。
     """
 
-    __slots__ = ("_explicit", "_derived", "_facts", "_source")
+    __slots__ = ("_explicit", "_derived", "_facts", "_source", "_properties")
 
-    def __init__(self, explicit, derived) -> None:
+    def __init__(self, explicit, derived, properties=()) -> None:
         # explicit / derived: dict[Triple, rule_id 或 None]
         self._explicit = frozenset(explicit)
         self._derived = frozenset(
@@ -100,6 +100,7 @@ class OntologyModel:
         )
         self._facts = frozenset(explicit) | frozenset(derived)
         self._source = dict(derived)
+        self._properties = frozenset(properties)
 
     @property
     def explicit_triples(self) -> Tuple[Triple, ...]:
@@ -116,6 +117,11 @@ class OntologyModel:
         """全部三元组（显式 + 推理），按字典序稳定排列。"""
         return tuple(sorted(self._facts))
 
+    @property
+    def properties(self) -> Tuple[str, ...]:
+        """已声明属性名，按字典序稳定排列。"""
+        return tuple(sorted(self._properties))
+
     def entails(self, subject: str, predicate: str, object_: str) -> bool:
         """判断 (subject, predicate, object_) 是否被当前模型蕴含。"""
         return Triple(subject, predicate, object_) in self._facts
@@ -128,10 +134,13 @@ class OntologyModel:
         """执行 SPARQL 风格 SELECT 查询，在显式与推理三元组上匹配。
 
         例如 SELECT ?x ?y WHERE { ?x knows ?y . ?y likes ?z }；
+        谓语位置除常量属性名外还可以写属性路径：^p（逆向）、a/b（序列）、
+        a|b（选择）、p?/p*/p+（零或一次/零或多次/一次或多次），圆括号分组，
+        如 SELECT ?x WHERE { ?x knows+ ?y } 沿显式与推理事实寻找间接关系；
         模式体中还可以出现 OPTIONAL { ... }（左连接，无匹配时块内变量未绑定）、
         FILTER ( 表达式 )（BOUND/!BOUND 与 =/!= 比较，多个 FILTER 逻辑与）
         以及 { ... } UNION { ... }（多个花括号分支取并集，分支内仅含三元组
-        模式，连续 UNION 从左到右结合）。
+        模式，连续 UNION 从左到右结合），OPTIONAL 与 UNION 内同样支持路径。
         查询不修改模型，重复执行结果一致。词法或语法错误抛出 OntologyError。
         """
         return run_query(self, text)
