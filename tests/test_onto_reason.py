@@ -3079,5 +3079,213 @@ class ExplainDiagnosticTests(unittest.TestCase):
         self.assertEqual(before, after)
 
 
+class AskTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def test_plain_match_true_and_false(self):
+        self.assertIs(self.model.ask("ASK WHERE { alice knows bob }"), True)
+        self.assertIs(self.model.ask("ASK WHERE { alice knows carol }"), False)
+
+    def test_join_with_shared_variables(self):
+        self.assertTrue(
+            self.model.ask("ASK WHERE { ?x knows ?y . ?y likes ?z }")
+        )
+        self.assertFalse(self.model.ask("ASK WHERE { ?x knows ?x }"))
+
+    def test_inferred_triples_match(self):
+        # alice likes bob 由规则 knows-likes 推出，alice friendOf carol 由
+        # friend-of-friend 推出，都与显式事实一样命中
+        self.assertTrue(self.model.ask("ASK WHERE { alice likes bob }"))
+        self.assertTrue(self.model.ask("ASK WHERE { alice friendOf carol }"))
+        self.assertFalse(self.model.ask("ASK WHERE { carol likes alice }"))
+
+    def test_ground_query_returns_bool_without_projection(self):
+        result = self.model.ask("ASK WHERE { ?x knows ?y }")
+        self.assertIs(result, True)
+
+    def test_optional_no_match_keeps_solution(self):
+        # carol 没有 knows 出边，OPTIONAL 无匹配时原解保留
+        self.assertTrue(
+            self.model.ask(
+                "ASK WHERE { ?x likes carol . OPTIONAL { ?x knows ?y } }"
+            )
+        )
+        # OPTIONAL 可满足时同样为真
+        self.assertTrue(
+            self.model.ask(
+                "ASK WHERE { ?x knows bob . OPTIONAL { ?x likes ?y } }"
+            )
+        )
+
+    def test_optional_unbound_variable_with_not_bound_filter(self):
+        # bob knows carol 但 bob 没有 friendOf 出边：OPTIONAL 未匹配，
+        # ?z 未绑定，!BOUND(?z) 为真
+        self.assertTrue(
+            self.model.ask(
+                "ASK WHERE { ?x knows ?y . OPTIONAL { ?x friendOf ?z }"
+                " . FILTER(!BOUND(?z)) }"
+            )
+        )
+        # alice friendOf carol 可推出，BOUND(?z) 在合并解上成立
+        self.assertTrue(
+            self.model.ask(
+                "ASK WHERE { ?x knows ?y . OPTIONAL { ?x friendOf ?z }"
+                " . FILTER(BOUND(?z)) }"
+            )
+        )
+
+    def test_filter_string_constant_and_variable_comparison(self):
+        self.assertTrue(
+            self.model.ask('ASK WHERE { ?x knows ?y . FILTER(?y = "bob") }')
+        )
+        self.assertFalse(
+            self.model.ask('ASK WHERE { ?x knows ?y . FILTER(?y = "nobody") }')
+        )
+        self.assertTrue(
+            self.model.ask(
+                "ASK WHERE { ?x knows ?y . ?y knows ?z . FILTER(?x != ?z) }"
+            )
+        )
+        self.assertFalse(
+            self.model.ask("ASK WHERE { ?x knows ?y . FILTER(?x = ?y) }")
+        )
+
+    def test_filter_comparison_with_unbound_variable_is_false(self):
+        # bob knows carol 但 bob 无 friendOf 出边：?z 未绑定，等值比较为假
+        self.assertFalse(
+            self.model.ask(
+                'ASK WHERE { ?x knows carol . OPTIONAL { ?x friendOf ?z }'
+                ' . FILTER(?z = "carol") }'
+            )
+        )
+
+    def test_union_merges_branches(self):
+        self.assertTrue(
+            self.model.ask(
+                "ASK WHERE { { ?x likes carol } UNION { ?x knows carol } }"
+            )
+        )
+        self.assertFalse(
+            self.model.ask(
+                "ASK WHERE { { alice knows carol } UNION { carol knows alice } }"
+            )
+        )
+
+    def test_filter_after_union_runs_on_merged_solutions(self):
+        self.assertTrue(
+            self.model.ask(
+                'ASK WHERE { { ?x knows ?y } UNION { ?x likes ?y }'
+                ' . FILTER(?y = "carol") }'
+            )
+        )
+        self.assertFalse(
+            self.model.ask(
+                'ASK WHERE { { ?x knows ?y } UNION { ?x likes ?y }'
+                ' . FILTER(?y = "nobody") }'
+            )
+        )
+
+    def test_property_paths(self):
+        model = path_model()
+        self.assertTrue(model.ask("ASK WHERE { a edge/edge c }"))
+        self.assertFalse(model.ask("ASK WHERE { a edge/edge d }"))
+        self.assertTrue(model.ask("ASK WHERE { c ^edge b }"))
+        self.assertTrue(model.ask("ASK WHERE { a edge|other x }"))
+        self.assertTrue(model.ask("ASK WHERE { a edge? a }"))
+        # iso 不出现在任何三元组中，p? 的零次分支不覆盖它
+        self.assertFalse(model.ask("ASK WHERE { iso edge? b }"))
+        self.assertTrue(model.ask("ASK WHERE { a edge+ d }"))
+        self.assertTrue(model.ask("ASK WHERE { a edge* a }"))
+
+    def test_cyclic_path_terminates(self):
+        model = path_model()
+        # b→c→d→b 成环，传递闭包有限结束
+        self.assertTrue(model.ask("ASK WHERE { b edge+ b }"))
+        self.assertTrue(model.ask("ASK WHERE { d edge+ c }"))
+        self.assertFalse(model.ask("ASK WHERE { x edge+ a }"))
+
+    def test_inferred_edges_participate_in_paths(self):
+        model = path_model()
+        # a edge x 由规则 other-to-edge 推出，invOnly 边全部由规则推出
+        self.assertTrue(model.ask("ASK WHERE { a edge x }"))
+        self.assertTrue(model.ask("ASK WHERE { c ^invOnly b }"))
+
+    def test_repeated_calls_consistent_and_do_not_mutate_model(self):
+        model = query_model()
+        before = (model.explicit_triples, model.derived_triples, model.triples)
+        text = (
+            "ASK WHERE { ?x knows ?y . OPTIONAL { ?x friendOf ?z }"
+            " . FILTER(!BOUND(?z)) }"
+        )
+        first = model.ask(text)
+        for _ in range(3):
+            self.assertIs(model.ask(text), first)
+        after = (model.explicit_triples, model.derived_triples, model.triples)
+        self.assertEqual(before, after)
+
+
+class AskSyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def assertAskError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.ask(text)
+        message = str(ctx.exception)
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+
+    def test_non_string_input_reports_received_type(self):
+        self.assertAskError(123, "str", "int")
+        self.assertAskError(None, "NoneType")
+        self.assertAskError(["ASK WHERE { ?x knows ?y }"], "list")
+
+    def test_empty_query(self):
+        self.assertAskError("", "ASK")
+        self.assertAskError("   \n\t", "ASK")
+
+    def test_select_form_rejected(self):
+        self.assertAskError("SELECT ?x WHERE { ?x knows ?y }", "ASK", "SELECT")
+
+    def test_projection_variable_rejected(self):
+        self.assertAskError("ASK ?x WHERE { ?x knows ?y }", "WHERE", "?x")
+
+    def test_star_rejected(self):
+        self.assertAskError("ASK * WHERE { ?x knows ?y }", "WHERE")
+
+    def test_trailing_content_rejected(self):
+        self.assertAskError("ASK WHERE { ?x knows ?y } ?z", "未知语句成分")
+
+    def test_lowercase_keywords_rejected(self):
+        self.assertAskError("ask where { ?x knows ?y }", "ASK")
+
+    def test_missing_where(self):
+        self.assertAskError("ASK { ?x knows ?y }", "WHERE")
+
+    def test_missing_braces(self):
+        self.assertAskError("ASK WHERE ?x knows ?y }", "'{'")
+        self.assertAskError("ASK WHERE { ?x knows ?y", "'}'")
+
+    def test_empty_where_body(self):
+        self.assertAskError("ASK WHERE { }", "为空")
+
+    def test_unclosed_string_lexical_error(self):
+        self.assertAskError('ASK WHERE { ?x knows "bob }', "字符位置")
+
+    def test_undeclared_property_rejected(self):
+        self.assertAskError("ASK WHERE { ?x unknown ?y }", "未声明", "unknown")
+
+    def test_undeclared_property_in_path_rejected(self):
+        self.assertAskError("ASK WHERE { ?x knows/unknown+ ?y }", "未声明")
+
+    def test_unsupported_form_rejected(self):
+        self.assertAskError("ASK WHERE { ?x knows ?y . OPTIONAL { } }", "为空")
+        self.assertAskError("ASK WHERE { ?x knows** ?y }", "量词")
+
+    def test_legal_query_without_match_is_false_not_error(self):
+        self.assertIs(self.model.ask("ASK WHERE { ?x knows nobody }"), False)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,7 @@ import itertools
 from typing import Iterator, Optional, Tuple
 
 from .errors import OntologyError
-from .query import QueryResult, run_query
+from .query import QueryResult, run_ask, run_query
 
 _VARIABLE_PREFIX = "?"
 
@@ -202,6 +202,7 @@ class OntologyModel:
     - derived_triples：推理结论，同样按字典序排列，每条带来源规则 id。
     - entails(s, p, o)：判断单条三元组是否被蕴含（显式或推理得出）。
     - explain(s, p, o)：给出该三元组的全部最短完整证明（Proof 元组）。
+    - ask(text)：SPARQL 风格 ASK 存在性查询，返回布尔值。
     - declared_properties：本体中已声明的属性名（查询谓语/属性路径据此校验）。
     所有读取接口均返回新对象，不改变模型内部数据。
     """
@@ -376,3 +377,19 @@ class OntologyModel:
         查询不修改模型，重复执行结果一致。词法或语法错误抛出 OntologyError。
         """
         return run_query(self, text)
+
+    def ask(self, text: str) -> bool:
+        """执行 SPARQL 风格 ASK 查询，返回是否存在至少一个满足条件的解。
+
+        形式为 ASK WHERE { ... }，WHERE 模式体与 query 完全同语法、同语义：
+        普通三元组模式、OPTIONAL 左连接、FILTER（BOUND/!BOUND 与 =/!= 比较，
+        多个 FILTER 逻辑与）、相邻花括号 UNION 以及谓语位置的属性路径
+        （^p、a/b、a|b、p?、p*、p+，路径中的属性名必须已声明），都在显式与
+        推理三元组的并集上求值。ASK 不做投影：不接受 SELECT、变量列表或
+        '*'，WHERE 花括号之后不允许任何后缀成分；关键字只接受大写。
+        至少存在一个满足全部条件的最终绑定时返回 True，否则返回 False
+        （合法查询无匹配不是错误）。查询不修改模型，重复执行结果一致。
+        输入不是字符串、查询为空、词法或语法非法、出现不支持的形式或关键字、
+        属性路径引用未声明属性时抛出 OntologyError。
+        """
+        return run_ask(self, text)

@@ -4,6 +4,7 @@
 支持的语法（关键字只接受大写）：
 
     SELECT (变量... | *) WHERE { 模式 ('.' 模式)* '.'? }
+    ASK WHERE { 模式 ('.' 模式)* '.'? }
     模式 := 三元组模式
           | OPTIONAL { 三元组模式 ('.' 三元组模式)* '.'? }
           | FILTER ( 表达式 )
@@ -42,6 +43,9 @@
   UNION 之后的 FILTER 在所有分支合并完成后执行，可引用任一分支的变量。
 - '*' 按模式（含 OPTIONAL 块与 UNION 分支内模式）从左到右首次出现的顺序
   投影全部变量；投影变量未绑定时结果行中以 None 占位。
+- ASK 与 SELECT 共用同一 WHERE 模式体语法与求值语义，但不做投影：
+  不接受 SELECT、变量列表或 '*'，WHERE 花括号之后也不允许任何后缀成分；
+  至少存在一个满足全部条件的最终绑定时返回 True，否则返回 False。
 
 查询在 OntologyModel.triples（显式 + 推理三元组）上做嵌套循环连接匹配，
 同一变量跨模式绑定同一字符串，一条事实可被多个模式复用。
@@ -582,6 +586,24 @@ class _Parser:
             raise self._error(f"右花括号后存在未知语句成分 {tok.value!r}", tok.pos)
         self._validate_projection(projection, clauses)
         return tuple(name for name, _ in projection), clauses, star
+
+    def parse_ask(self) -> List[tuple]:
+        """解析 ASK WHERE { ... }，返回模式子句列表（无投影）。
+
+        ASK 不做投影：关键字 ASK 之后必须紧跟 WHERE，花括号之后不允许
+        任何后缀成分；SELECT、变量列表或 '*' 都会按缺少关键字/未知成分报错。
+        """
+        self._expect_keyword("ASK")
+        self._expect_keyword("WHERE")
+        if self._eof() or self._peek().kind != _TOK_LBRACE:
+            raise self._error("WHERE 后缺少左花括号 '{'", self._here_pos())
+        self._advance()
+        clauses = self._parse_group_body(optional=False)
+        # _parse_group_body 已消费右花括号
+        if not self._eof():
+            tok = self._peek()
+            raise self._error(f"右花括号后存在未知语句成分 {tok.value!r}", tok.pos)
+        return clauses
 
     def _parse_projection(self) -> Tuple[List[Tuple[str, int]], bool]:
         if self._eof():
@@ -1239,6 +1261,15 @@ def _compile_query(text, properties: frozenset) -> Tuple[Tuple[str, ...], List[t
     return _Parser(text, lexer, frozenset(properties)).parse()
 
 
+def _compile_ask(text, properties: frozenset) -> List[tuple]:
+    if not isinstance(text, str):
+        raise OntologyError(
+            f"查询文本必须是 str 类型，收到 {type(text).__name__}"
+        )
+    lexer = _Lexer(text)
+    return _Parser(text, lexer, frozenset(properties)).parse_ask()
+
+
 def _all_patterns(clauses) -> List[Tuple[Any, Any, Any]]:
     """按子句顺序取出全部三元组模式（含 OPTIONAL 块与 UNION 分支内模式）。"""
     patterns: List[Tuple[Any, Any, Any]] = []
@@ -1400,15 +1431,12 @@ def _eval_filter(expr: tuple, binding: dict) -> bool:
     return equal if kind == _EXPR_EQ else not equal
 
 
-def run_query(model, text) -> QueryResult:
-    """在 model.triples 上执行查询，返回去重并按字典序排序后的 QueryResult。"""
-    properties = frozenset(getattr(model, "declared_properties", ()))
-    projection, clauses, star = _compile_query(text, properties)
-    if star:
-        projection = _star_variables(clauses)
+def _eval_clauses(matcher: _PathMatcher, clauses) -> List[dict]:
+    """按子句顺序在 matcher 上求值，返回全部最终绑定（无匹配时为空列表）。
 
-    facts = model.triples
-    matcher = _PathMatcher(facts)
+    SELECT 与 ASK 共用这一段求值逻辑：BGP 内连接、OPTIONAL 左连接、
+    UNION 各分支独立匹配后合并、FILTER 按逻辑与过滤此前全部解。
+    """
     bindings: List[dict] = [{}]
     for kind, patterns, expr in clauses:
         if kind == _CLAUSE_FILTER:
@@ -1435,6 +1463,18 @@ def run_query(model, text) -> QueryResult:
             bindings = _match_patterns(matcher, bindings, patterns)
         if not bindings:
             break
+    return bindings
+
+
+def run_query(model, text) -> QueryResult:
+    """在 model.triples 上执行查询，返回去重并按字典序排序后的 QueryResult。"""
+    properties = frozenset(getattr(model, "declared_properties", ()))
+    projection, clauses, star = _compile_query(text, properties)
+    if star:
+        projection = _star_variables(clauses)
+
+    matcher = _PathMatcher(model.triples)
+    bindings = _eval_clauses(matcher, clauses)
 
     rows = {tuple(binding.get(name) for name in projection) for binding in bindings}
     # None（未绑定）排在所有字符串之前，保证混合取值时字典序排序稳定。
@@ -1445,3 +1485,11 @@ def run_query(model, text) -> QueryResult:
         )
     )
     return QueryResult(projection, ordered)
+
+
+def run_ask(model, text) -> bool:
+    """在 model.triples 上执行 ASK 查询：至少一个最终解返回 True，否则 False。"""
+    properties = frozenset(getattr(model, "declared_properties", ()))
+    clauses = _compile_ask(text, properties)
+    matcher = _PathMatcher(model.triples)
+    return bool(_eval_clauses(matcher, clauses))
