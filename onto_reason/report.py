@@ -91,7 +91,11 @@ class ValidationReport:
           classMembershipPredicate 表达的两项类成员事实
           (subject, classMembershipPredicate, class)；
         - functionalPropertyValue：两项分别证明个体在约束属性上的两个
-          不同取值事实 (subject, property, object)。
+          不同取值事实 (subject, property, object)；
+        - asymmetricPropertyPair：两项分别证明约束属性下反向成立的两条
+          事实 (subject, property, object) 与 (object, property, subject)，
+          顺序与 evidence 两项一致；自反违反时两项证明同一条事实
+          (subject, property, subject)。
 
         显式事实的证明元组恰含一个 kind 为 "explicit"、ruleId 为 None、
         premises 为空的 Proof；推理事实的证明元组为 OntologyModel.explain

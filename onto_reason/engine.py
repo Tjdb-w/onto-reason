@@ -10,17 +10,20 @@
 - rules：规则数组，每项为 {"id": ..., "if": [...], "then": [...]}；
   id 为字符串或整数且不得重复；if/then 为三元组模式数组，结构与 triples 相同，
   主语/宾语可以是以 "?" 开头的变量；then 中出现的变量必须在 if 中被绑定。
-- consistency：可选对象，恰含 classMembershipPredicate、disjointClasses、
-  functionalProperties 三个字段。
+- consistency：可选对象，必含 classMembershipPredicate、disjointClasses、
+  functionalProperties 三个字段，可选 asymmetricProperties 字段（省略或为空
+  数组表示不检查非对称属性约束）。
 
 推理：对规则做前向链推理直至不动点。结论按 (主语, 谓语, 宾语) 字典序输出，
 同一三元组被多条规则推出时保留最先推出它的规则 id；显式三元组优先于推理结论。
 
 一致性诊断在结构校验与不动点推理完成后进行：同一个体同时属于一条
-disjointClasses 约束中的两个类、或在一条 functionalProperties 约束的属性上
-有两个不同取值，parse 抛出 InconsistencyError 且不返回模型；diagnose 不抛
-异常，改为返回 ValidationReport（is_consistent 为 False、model 为 None、
-diagnostics 按与异常冲突行相同的顺序列出全部两两冲突）。
+disjointClasses 约束中的两个类、在一条 functionalProperties 约束的属性上
+有两个不同取值、或在一条 asymmetricProperties 约束的属性下两个节点双向
+连通（含单节点自反），parse 抛出 InconsistencyError 且不返回模型；
+diagnose 不抛异常，改为返回 ValidationReport（is_consistent 为 False、
+model 为 None、diagnostics 按与异常冲突行相同的顺序列出全部两两冲突，
+非对称属性诊断排在互斥类与函数型属性诊断之后）。
 """
 
 from __future__ import annotations
@@ -37,15 +40,20 @@ _TRIPLE_KEYS = frozenset({"subject", "predicate", "object"})
 _RULE_KEYS = frozenset({"id", "if", "then"})
 _VARIABLE_PREFIX = "?"
 
-_CONSISTENCY_KEYS = frozenset(
+_CONSISTENCY_REQUIRED = frozenset(
     {"classMembershipPredicate", "disjointClasses", "functionalProperties"}
 )
+_CONSISTENCY_OPTIONAL = frozenset({"asymmetricProperties"})
 _DISJOINT_KEYS = frozenset({"id", "classes"})
 _FUNCTIONAL_KEYS = frozenset({"id", "property"})
+_ASYMMETRIC_KEYS = frozenset({"id", "property"})
 
-# 冲突类型的稳定排序：disjointClasses 在 functionalProperties 之前。
+# 冲突类型的稳定排序：disjointClasses 在 functionalProperties 之前，
+# asymmetricProperties 诊断整体排在两者之后（排序键首元素为类别序号）。
 _CONFLICT_DISJOINT = 0
 _CONFLICT_FUNCTIONAL = 1
+_KIND_EXISTING = 0
+_KIND_ASYMMETRIC = 1
 
 
 def _is_variable(value: str) -> bool:
@@ -88,13 +96,22 @@ class _FunctionalConstraint:
         self.property = property_
 
 
-class _Consistency:
-    __slots__ = ("membership_predicate", "disjoint", "functional")
+class _AsymmetricConstraint:
+    __slots__ = ("constraint_id", "property")
 
-    def __init__(self, membership_predicate, disjoint, functional) -> None:
+    def __init__(self, constraint_id, property_: str) -> None:
+        self.constraint_id = constraint_id
+        self.property = property_
+
+
+class _Consistency:
+    __slots__ = ("membership_predicate", "disjoint", "functional", "asymmetric")
+
+    def __init__(self, membership_predicate, disjoint, functional, asymmetric) -> None:
         self.membership_predicate = membership_predicate
         self.disjoint = disjoint
         self.functional = functional
+        self.asymmetric = asymmetric
 
 
 class OntologyEngine:
@@ -350,9 +367,9 @@ class OntologyEngine:
                 f"收到 {type(root).__name__}"
             )
         keys = set(root)
-        if keys != _CONSISTENCY_KEYS:
-            missing = _CONSISTENCY_KEYS - keys
-            extra = keys - _CONSISTENCY_KEYS
+        missing = _CONSISTENCY_REQUIRED - keys
+        extra = keys - _CONSISTENCY_REQUIRED - _CONSISTENCY_OPTIONAL
+        if missing or extra:
             detail = []
             if missing:
                 detail.append("缺少 " + ", ".join(sorted(missing)))
@@ -377,7 +394,11 @@ class OntologyEngine:
         functional = self._parse_functional(
             root["functionalProperties"], properties, seen_ids
         )
-        return _Consistency(predicate, disjoint, functional)
+        # asymmetricProperties 省略或为空数组表示不检查；其 id 只要求同一数组内不重复。
+        asymmetric = self._parse_asymmetric(
+            root.get("asymmetricProperties", []), properties
+        )
+        return _Consistency(predicate, disjoint, functional, asymmetric)
 
     def _claim_constraint_id(self, constraint_id, where: str, seen_ids: dict) -> None:
         if not _is_id(constraint_id):
@@ -485,6 +506,45 @@ class OntologyEngine:
             result.append(_FunctionalConstraint(item["id"], property_))
         return result
 
+    def _parse_asymmetric(self, items, properties: frozenset):
+        if not isinstance(items, list):
+            raise OntologyError(
+                "consistency['asymmetricProperties'] 必须是对象数组，"
+                f"收到 {type(items).__name__}"
+            )
+        result = []
+        seen_ids: dict = {}
+        for index, item in enumerate(items):
+            where = f"consistency['asymmetricProperties'][{index}]"
+            if not isinstance(item, dict):
+                raise OntologyError(
+                    f"{where} 必须是包含 id/property 的对象，收到 {item!r}"
+                )
+            keys = set(item)
+            if keys != _ASYMMETRIC_KEYS:
+                missing = _ASYMMETRIC_KEYS - keys
+                extra = keys - _ASYMMETRIC_KEYS
+                detail = []
+                if missing:
+                    detail.append("缺少 " + ", ".join(sorted(missing)))
+                if extra:
+                    detail.append("多出 " + ", ".join(sorted(extra)))
+                raise OntologyError(f"{where} 结构不合法（{'; '.join(detail)}）")
+
+            self._claim_constraint_id(item["id"], where, seen_ids)
+
+            property_ = item["property"]
+            if not isinstance(property_, str) or not property_:
+                raise OntologyError(
+                    f"{where}['property'] 必须是非空字符串，收到 {property_!r}"
+                )
+            if property_ not in properties:
+                raise OntologyError(
+                    f"{where}['property'] 引用了未声明的属性 {property_!r}"
+                )
+            result.append(_AsymmetricConstraint(item["id"], property_))
+        return result
+
     # ---------- 前向链推理 ----------
 
     def _forward_chain(self, explicit: List[Triple], rules: List[_RulePattern]) -> Dict[Triple, object]:
@@ -573,10 +633,14 @@ class OntologyEngine:
         conflicts.extend(
             self._functional_conflicts(fact_source, consistency.functional)
         )
+        conflicts.extend(
+            self._asymmetric_conflicts(fact_source, consistency.asymmetric)
+        )
         if not conflicts:
             return []
 
-        # 按约束 id 的字符串表示、冲突类型、subject、冲突条目字典序排列。
+        # 互斥类/函数型属性冲突保持既有排序（约束 id 字符串、冲突类型、subject、
+        # 冲突条目字典序）；非对称属性冲突整体排在之后，键首元素为类别序号。
         conflicts.sort(key=lambda item: item[0])
         return conflicts
 
@@ -636,6 +700,7 @@ class OntologyEngine:
                             "message": message,
                         }
                         key = (
+                            _KIND_EXISTING,
                             str(constraint.constraint_id),
                             _CONFLICT_DISJOINT,
                             subject,
@@ -687,6 +752,7 @@ class OntologyEngine:
                             "message": message,
                         }
                         key = (
+                            _KIND_EXISTING,
                             str(constraint.constraint_id),
                             _CONFLICT_FUNCTIONAL,
                             subject,
@@ -700,6 +766,72 @@ class OntologyEngine:
                         )
                         conflicts.append((key, diagnostic, pair))
         return conflicts
+
+    def _asymmetric_conflicts(self, fact_source: Dict[Triple, Optional[object]], constraints):
+        conflicts = []
+        for decl_index, constraint in enumerate(constraints):
+            property_ = constraint.property
+            # (subject, object) -> 来源：显式与推理三元组并集，显式事实优先。
+            edges: Dict[Tuple[str, str], Optional[object]] = {}
+            for triple, source in fact_source.items():
+                if triple.predicate != property_:
+                    continue
+                edges.setdefault((triple.subject, triple.object), source)
+            # 按无序节点对去重：(a, p, b) 与 (b, p, a) 同时存在记一次违反；
+            # a == b 时 (a, p, a) 单独构成一次自反违反。
+            violated = set()
+            for subject, object_ in edges:
+                if (object_, subject) not in edges:
+                    continue
+                a, b = (subject, object_) if subject <= object_ else (object_, subject)
+                violated.add((a, b))
+            for a, b in violated:
+                src1 = edges[(a, b)]
+                src2 = edges[(b, a)]
+                if a == b:
+                    message = (
+                        f"[asymmetricProperties id={constraint.constraint_id!r}] "
+                        f"非对称属性 {property_!r} 在节点 {a!r} 上自反成立："
+                        f"({a!r}, {a!r}) 为{self._describe_source(src1)}"
+                    )
+                else:
+                    message = (
+                        f"[asymmetricProperties id={constraint.constraint_id!r}] "
+                        f"非对称属性 {property_!r} 在节点 {a!r} 与 {b!r} 之间双向成立："
+                        f"({a!r}, {b!r}) 为{self._describe_source(src1)}；"
+                        f"({b!r}, {a!r}) 为{self._describe_source(src2)}"
+                    )
+                diagnostic = {
+                    "kind": "asymmetricPropertyPair",
+                    "constraintId": constraint.constraint_id,
+                    "property": property_,
+                    "evidence": (
+                        {"subject": a, "object": b, "source": self._source_info(src1)},
+                        {"subject": b, "object": a, "source": self._source_info(src2)},
+                    ),
+                    "message": message,
+                }
+                key = (
+                    _KIND_ASYMMETRIC,
+                    decl_index,
+                    a,
+                    b,
+                    self._source_sort_key(src1),
+                    self._source_sort_key(src2),
+                )
+                pair = (
+                    Triple(a, property_, b),
+                    Triple(b, property_, a),
+                )
+                conflicts.append((key, diagnostic, pair))
+        return conflicts
+
+    @staticmethod
+    def _source_sort_key(source):
+        """来源的稳定排序键：显式事实在推理结论之前，推理按规则 id 字符串排序。"""
+        if source is None:
+            return (0, "")
+        return (1, str(source))
 
     @staticmethod
     def _source_info(source) -> dict:
