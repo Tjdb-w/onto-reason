@@ -3515,5 +3515,273 @@ class ConstructSyntaxErrorTests(unittest.TestCase):
         )
 
 
+class DescribeTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def test_describes_triples_touching_each_bound_value(self):
+        # ?x knows ?y 的解：(alice, bob) 与 (bob, carol)，
+        # 描述 ?x=alice/bob：收集主语或宾语为 alice 或 bob 的全部三元组
+        result = self.model.describe("DESCRIBE ?x WHERE { ?x knows ?y }")
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+        self.assertIsInstance(result, tuple)
+        self.assertTrue(all(isinstance(t, Triple) for t in result))
+
+    def test_star_describes_all_bound_values_per_solution(self):
+        result = self.model.describe("DESCRIBE * WHERE { ?x knows ?y }")
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+
+    def test_explicit_and_derived_triples_both_included(self):
+        # alice likes bob 是推理结论，alice knows bob 是显式事实，描述时不区分
+        result = self.model.describe("DESCRIBE ?x WHERE { ?x likes bob }")
+        self.assertIn(Triple("alice", "knows", "bob"), result)
+        self.assertIn(Triple("alice", "likes", "bob"), result)
+
+    def test_derived_triple_drives_matching_and_description(self):
+        # alice friendOf carol 由规则推出，模式在并集上匹配，
+        # 描述 alice 时显式与推理三元组一并返回
+        result = self.model.describe("DESCRIBE ?x WHERE { ?x friendOf carol }")
+        self.assertIn(Triple("alice", "friendOf", "carol"), result)
+        self.assertIn(Triple("alice", "knows", "bob"), result)
+
+    def test_results_merged_deduplicated_and_sorted(self):
+        # UNION 两个分支在同一名称上产生重复解，结果仍跨解去重并按字典序排列
+        result = self.model.describe(
+            "DESCRIBE * WHERE { { ?x knows ?y } UNION { ?x likes ?y } }"
+        )
+        self.assertEqual(result, tuple(sorted(set(result))))
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+
+    def test_no_matching_bindings_returns_empty_tuple(self):
+        result = self.model.describe("DESCRIBE ?x WHERE { ?x knows nobody }")
+        self.assertEqual(result, ())
+
+    def test_optional_unbound_variable_ignored_in_that_solution(self):
+        # alice knows bob：OPTIONAL { ?y friendOf ?z } 无匹配，?z 未绑定忽略；
+        # ?x=alice 与 ?y=bob 仍被描述
+        result = self.model.describe(
+            "DESCRIBE ?x ?y ?z WHERE "
+            "{ ?x knows ?y . OPTIONAL { ?y friendOf ?z } }"
+        )
+        self.assertIn(Triple("alice", "knows", "bob"), result)
+        self.assertIn(Triple("bob", "knows", "carol"), result)
+
+    def test_star_with_optional_ignores_unbound_slots(self):
+        result = self.model.describe(
+            "DESCRIBE * WHERE "
+            "{ ?x knows ?y . OPTIONAL { ?y friendOf ?z } }"
+        )
+        # 只描述解中已绑定的 alice/bob/carol，没有 ?z 绑定的解不引入新名称
+        self.assertIn(Triple("alice", "knows", "bob"), result)
+
+    def test_union_bound_variables_described(self):
+        result = self.model.describe(
+            "DESCRIBE ?x WHERE "
+            "{ { ?x knows carol } UNION { ?x likes carol } }"
+        )
+        # 两个分支都只有 bob（bob knows carol、bob likes carol）
+        self.assertIn(Triple("bob", "knows", "carol"), result)
+        self.assertIn(Triple("alice", "knows", "bob"), result)
+
+    def test_filter_restricts_described_names(self):
+        result = self.model.describe(
+            'DESCRIBE ?x WHERE { ?x knows ?y . FILTER(?y = "bob") }'
+        )
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+            ),
+        )
+
+    def test_not_bound_filter_describes_only_unbound_solutions(self):
+        # ?x knows ?y 的解：alice 与 bob。OPTIONAL { ?x friendOf ?z }：
+        # alice friendOf carol 可推出（?z 绑定，被 !BOUND 过滤）；
+        # bob 无 friendOf 出边（?z 未绑定，保留）。最终只描述 bob：
+        # 每条结果三元组的主语或宾语必须是 bob。
+        result = self.model.describe(
+            "DESCRIBE ?x WHERE { ?x knows ?y ."
+            " OPTIONAL { ?x friendOf ?z } . FILTER(!BOUND(?z)) }"
+        )
+        self.assertTrue(result)
+        self.assertTrue(
+            all(t.subject == "bob" or t.object == "bob" for t in result)
+        )
+        # 不触及 bob 的三元组（alice friendOf carol）不得出现
+        self.assertNotIn(Triple("alice", "friendOf", "carol"), result)
+
+    def test_property_path_in_where_body(self):
+        model = path_model()
+        # a edge+ d 经 b、c 传递可达；描述 a 时所有与 a 相关的三元组都返回
+        result = model.describe("DESCRIBE ?x WHERE { ?x edge+ d }")
+        self.assertTrue(any(t.subject == "a" or t.object == "a" for t in result))
+
+    def test_bound_value_without_any_triple_returns_empty(self):
+        # ?z 绑定为字面量 carol... 改用：模式能匹配但绑定值不在任何
+        # 三元组主/宾语位置（likes 的宾语 bob 实际上出现，这里用路径零次分支
+        # 绑定到无邻接三元组的孤立节点时仍可能描述自身边——故直接用空模型）
+        empty = parse(make_doc(triples=[], rules=[]))
+        self.assertEqual(
+            empty.describe("DESCRIBE ?x WHERE { ?x knows? ?x }"), ()
+        )
+
+    def test_repeated_execution_stable_and_does_not_mutate_model(self):
+        before = (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        )
+        proofs_before = self.model.explain("alice", "likes", "bob")
+        text = "DESCRIBE * WHERE { ?x knows ?y . OPTIONAL { ?x likes ?z } }"
+        first = self.model.describe(text)
+        for _ in range(3):
+            self.assertEqual(self.model.describe(text), first)
+        after = (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        )
+        self.assertEqual(before, after)
+        self.assertEqual(
+            self.model.explain("alice", "likes", "bob"), proofs_before
+        )
+
+    def test_existing_query_entrypoints_unchanged(self):
+        # describe 是纯新增入口，query/ask/construct 语义不受影响
+        self.assertEqual(
+            self.model.query("SELECT ?x WHERE { ?x knows ?y }").variables,
+            ("?x",),
+        )
+        self.assertTrue(self.model.ask("ASK WHERE { alice knows bob }"))
+        self.assertIn(
+            Triple("alice", "friendOf", "carol"),
+            self.model.construct(
+                "CONSTRUCT { ?x friendOf ?z } WHERE "
+                "{ ?x knows ?y . ?y likes ?z }"
+            ),
+        )
+
+
+class DescribeSyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def assertDescribeError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.describe(text)
+        message = str(ctx.exception)
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+
+    def test_non_str_input(self):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.describe(123)
+        self.assertIn("str", str(ctx.exception))
+
+    def test_empty_and_lowercase_keywords(self):
+        self.assertDescribeError("")
+        self.assertDescribeError("describe ?x WHERE { ?x knows ?y }")
+        self.assertDescribeError("DESCRIBE ?x where { ?x knows ?y }")
+
+    def test_projection_errors(self):
+        self.assertDescribeError(
+            "DESCRIBE WHERE { ?x knows ?y }", "投影变量"
+        )
+        self.assertDescribeError("DESCRIBE")
+        self.assertDescribeError(
+            "DESCRIBE ?x ?x WHERE { ?x knows ?y }", "重复"
+        )
+        self.assertDescribeError(
+            "DESCRIBE alice WHERE { alice knows ?y }", "变量"
+        )
+        self.assertDescribeError(
+            "DESCRIBE * ?x WHERE { ?x knows ?y }", "未知语句成分"
+        )
+        self.assertDescribeError(
+            "DESCRIBE ?x * WHERE { ?x knows ?y }", "未知语句成分"
+        )
+
+    def test_missing_where_and_braces(self):
+        self.assertDescribeError(
+            "DESCRIBE ?x { ?x knows ?y }", "变量"
+        )
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE ?x knows ?y }", "'{'"
+        )
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { ?x knows ?y", "'}'"
+        )
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { }", "空"
+        )
+
+    def test_trailing_content_rejected(self):
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { ?x knows ?y } EXTRA", "未知语句成分"
+        )
+        self.assertDescribeError(
+            "DESCRIBE * WHERE { ?x knows ?y } }", "未知语句成分"
+        )
+
+    def test_unsupported_where_forms_rejected(self):
+        # 嵌套花括号组（无 UNION 连接）属于不支持的形式
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { { ?x knows ?y } }"
+        )
+        # 变量谓语
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { ?a ?p ?b }", "谓语"
+        )
+        # 未声明属性路径
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { ?x hates+ ?y }", "未声明"
+        )
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { ?x knows/hates ?y }", "未声明"
+        )
+
+    def test_legal_query_with_data_mismatch_is_not_error(self):
+        # 合法查询仅数据不匹配时返回空元组而非抛异常
+        self.assertEqual(
+            self.model.describe("DESCRIBE ?x WHERE { ?x knows nobody }"),
+            (),
+        )
+        self.assertEqual(
+            self.model.describe(
+                'DESCRIBE ?x WHERE { ?x knows ?y . FILTER(?y = "nobody") }'
+            ),
+            (),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

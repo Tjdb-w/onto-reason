@@ -10,7 +10,13 @@ import itertools
 from typing import Iterator, Optional, Tuple
 
 from .errors import OntologyError
-from .query import QueryResult, run_ask, run_construct, run_query
+from .query import (
+    QueryResult,
+    run_ask,
+    run_construct,
+    run_describe,
+    run_query,
+)
 
 _VARIABLE_PREFIX = "?"
 
@@ -204,6 +210,8 @@ class OntologyModel:
     - explain(s, p, o)：给出该三元组的全部最短完整证明（Proof 元组）。
     - ask(text)：SPARQL 风格 ASK 存在性查询，返回布尔值。
     - construct(text)：SPARQL 风格 CONSTRUCT 查询，返回生成的 Triple 元组。
+    - describe(text)：SPARQL 风格 DESCRIBE 查询，返回绑定值相关的全部
+      三元组（显式与推理并集），按字典序去重排序的只读 Triple 元组。
     - declared_properties：本体中已声明的属性名（查询谓语/属性路径据此校验）。
     所有读取接口均返回新对象，不改变模型内部数据。
     """
@@ -413,3 +421,24 @@ class OntologyModel:
         未声明属性时抛出 OntologyError。
         """
         return run_construct(self, text)
+
+    def describe(self, text: str) -> Tuple[Triple, ...]:
+        """执行 SPARQL 风格 DESCRIBE 查询，返回与绑定值相关的全部三元组。
+
+        形式为 DESCRIBE (?x ?y | *) WHERE { 模式体 }：投影位置只接受一个或
+        多个互不重复的查询变量，或单独一个星号；WHERE 模式体与 query/ask/
+        construct 完全同语法、同语义（三元组模式、OPTIONAL、FILTER、UNION
+        与谓语属性路径，均在显式与推理三元组的并集上求值）。
+        星号表示描述每个最终绑定中当前已绑定的全部变量值；指定变量时分别
+        取其绑定值，未绑定变量（如 OPTIONAL 未命中或仅出现在其他 UNION
+        分支）在本次解中忽略。
+        对每个待描述名称 N，收集主语或宾语为 N 的全部三元组，不因三元组
+        来自显式事实还是某条规则而改变；所有解产生的描述合并后按主语、
+        谓语、宾语的字典序去重，以只读 Triple 元组返回。无匹配绑定、变量
+        均未绑定或描述集合为空时返回空元组。同一模型重复执行同一文本结果
+        相同，且不修改模型数据或已有证明。输入不是字符串、查询为空、关键字
+        不是大写、投影为空或含常量、变量名重复、花括号不配对、WHERE 后有
+        后缀、模式体出现子查询或不支持形式、属性路径引用未声明属性时抛出
+        OntologyError；合法查询仅有数据不匹配时不视为异常。
+        """
+        return run_describe(self, text)

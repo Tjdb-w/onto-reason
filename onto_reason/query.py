@@ -53,6 +53,13 @@
   FILTER 或 UNION）。对每个通过 WHERE 条件的最终绑定逐项实例化模板；
   主语或宾语变量在该绑定中未绑定时不生成对应三元组，其余模板继续处理。
   结果为按字典序去重排序的 Triple 元组，不写回模型。
+- DESCRIBE (变量... | *) WHERE { 模式体 }：投影位置只接受一个或多个
+  互不重复的查询变量，或单独一个 '*'；WHERE 模式体与 SELECT/ASK 完全同
+  语法、同语义。'*' 表示描述每个最终绑定中当前已绑定的全部变量值；指定
+  变量时分别取其绑定值，未绑定变量在本次解中忽略。对每个待描述名称 N，
+  结果取显式与推理三元组并集中主语或宾语为 N 的全部三元组；所有解产生的
+  描述合并后按 (主语, 谓语, 宾语) 字典序去重排序。无匹配绑定、变量均未
+  绑定或描述集合为空时返回空元组；查询不修改模型，重复执行结果一致。
 
 查询在 OntologyModel.triples（显式 + 推理三元组）上做嵌套循环连接匹配，
 同一变量跨模式绑定同一字符串，一条事实可被多个模式复用。
@@ -729,6 +736,62 @@ class _Parser:
             )
         return templates
 
+    def parse_describe(self) -> Tuple[Tuple[str, ...], List[tuple], bool]:
+        """解析 DESCRIBE (变量... | *) WHERE { ... }。
+
+        返回 (投影变量名元组, 模式子句列表, 是否星号投影)。投影位置只接受
+        一个或多个互不重复的查询变量，或单独一个 '*'；与 SELECT 不同，
+        DESCRIBE 不要求投影变量出现在模式中——这类变量在任何解中都未绑定，
+        按“未绑定变量在本次解中忽略”的语义处理。WHERE 模式体与 SELECT/ASK
+        完全同语法；花括号之后不允许任何后缀成分。
+        """
+        self._expect_keyword("DESCRIBE")
+        projection, star = self._parse_describe_projection()
+        self._expect_keyword("WHERE")
+        if self._eof() or self._peek().kind != _TOK_LBRACE:
+            raise self._error("WHERE 后缺少左花括号 '{'", self._here_pos())
+        self._advance()
+        clauses = self._parse_group_body(optional=False)
+        # _parse_group_body 已消费右花括号
+        if not self._eof():
+            tok = self._peek()
+            raise self._error(f"右花括号后存在未知语句成分 {tok.value!r}", tok.pos)
+        return tuple(name for name, _ in projection), clauses, star
+
+    def _parse_describe_projection(self) -> Tuple[List[Tuple[str, int]], bool]:
+        """解析 DESCRIBE 后的投影：一个或多个变量，或单独一个 '*'。"""
+        if self._eof():
+            raise self._error("DESCRIBE 后缺少投影变量或 '*'", len(self._text))
+        if self._peek().kind == _TOK_STAR:
+            self._advance()
+            # '*' 后必须紧跟 WHERE，不允许与变量混写
+            if self._eof() or self._peek().kind != _TOK_NAME or self._peek().value != "WHERE":
+                raise self._error("'*' 与 WHERE 之间存在未知语句成分", self._here_pos())
+            return [], True
+
+        names: List[Tuple[str, int]] = []
+        seen = set()
+        while not self._eof():
+            tok = self._peek()
+            if tok.kind == _TOK_NAME and tok.value == "WHERE":
+                break
+            if tok.kind != _TOK_VAR:
+                raise self._error(
+                    f"DESCRIBE 后只能出现变量或 '*'，遇到未知语句成分 {tok.value!r}",
+                    tok.pos,
+                )
+            if tok.value in seen:
+                raise self._error(
+                    f"投影变量 {tok.value} 重复（字符位置 {tok.pos}）",
+                    tok.pos,
+                )
+            seen.add(tok.value)
+            names.append((tok.value, tok.pos))
+            self._advance()
+        if not names:
+            raise self._error("DESCRIBE 后缺少投影变量或 '*'", self._here_pos())
+        return names, False
+
     def _parse_projection(self) -> Tuple[List[Tuple[str, int]], bool]:
         if self._eof():
             raise self._error("SELECT 后缺少投影变量或 '*'", len(self._text))
@@ -1403,6 +1466,15 @@ def _compile_construct(text, properties: frozenset) -> Tuple[List[tuple], List[t
     return _Parser(text, lexer, frozenset(properties)).parse_construct()
 
 
+def _compile_describe(text, properties: frozenset) -> Tuple[Tuple[str, ...], List[tuple], bool]:
+    if not isinstance(text, str):
+        raise OntologyError(
+            f"查询文本必须是 str 类型，收到 {type(text).__name__}"
+        )
+    lexer = _Lexer(text)
+    return _Parser(text, lexer, frozenset(properties)).parse_describe()
+
+
 def _all_patterns(clauses) -> List[Tuple[Any, Any, Any]]:
     """按子句顺序取出全部三元组模式（含 OPTIONAL 块与 UNION 分支内模式）。"""
     patterns: List[Tuple[Any, Any, Any]] = []
@@ -1652,3 +1724,41 @@ def run_construct(model, text) -> tuple:
                 continue
             generated.add(Triple(subject, predicate, object_))
     return tuple(sorted(generated))
+
+
+def run_describe(model, text) -> tuple:
+    """在 model.triples 上执行 DESCRIBE 查询，返回去重排序后的 Triple 元组。
+
+    WHERE 模式体与 SELECT/ASK 同语义求值：'*' 对每个最终绑定取其当前已
+    绑定的全部变量值作为待描述名称；指定变量时分别取其绑定值，未绑定变量
+    在本次解中忽略。对每个待描述名称 N，收集显式与推理三元组并集中主语或
+    宾语为 N 的全部三元组，不因来源是显式事实还是某条规则而有所区别；全部
+    解的描述合并后按 (主语, 谓语, 宾语) 字典序去重排序。无匹配绑定、变量
+    均未绑定或描述集合为空时返回空元组。查询不修改模型与已有证明，重复执行
+    同一模型与查询结果一致。
+    """
+    properties = frozenset(getattr(model, "declared_properties", ()))
+    projection, clauses, star = _compile_describe(text, properties)
+    if star:
+        projection = _star_variables(clauses)
+
+    matcher = _PathMatcher(model.triples)
+    bindings = _eval_clauses(matcher, clauses)
+
+    names = set()
+    if star:
+        # 每个最终绑定只描述其中当前已绑定的变量值（与投影顺序无关）
+        for binding in bindings:
+            names.update(binding.values())
+    else:
+        for binding in bindings:
+            for name in projection:
+                value = binding.get(name)
+                if value is not None:
+                    names.add(value)
+
+    described = set()
+    for triple in model.triples:
+        if triple.subject in names or triple.object in names:
+            described.add(triple)
+    return tuple(sorted(described))
