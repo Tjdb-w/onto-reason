@@ -1428,6 +1428,119 @@ class ConsistencyValidationTests(unittest.TestCase):
             )
         self.assertIn("disjointClasses", str(ctx.exception))
 
+    def test_asymmetric_optional_field_accepted(self):
+        # 省略 asymmetricProperties 的旧输入与显式空数组都合法
+        old = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [],
+            "functionalProperties": [],
+        }
+        self.assertIsNotNone(parse(consistency_doc(consistency=old)))
+        empty = dict(old, asymmetricProperties=[])
+        self.assertIsNotNone(parse(consistency_doc(consistency=empty)))
+
+    def test_asymmetric_item_validation(self):
+        base = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [],
+            "functionalProperties": [],
+            "asymmetricProperties": [{"id": "a1"}],
+        }
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("consistency['asymmetricProperties'][0]", str(ctx.exception))
+
+        base["asymmetricProperties"] = [{"id": "a1", "property": ""}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("property", str(ctx.exception))
+
+        base["asymmetricProperties"] = [{"id": "a1", "property": "nope"}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("nope", str(ctx.exception))
+        self.assertIn("未声明的属性", str(ctx.exception))
+
+        base["asymmetricProperties"] = [{"id": "", "property": "knows"}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("consistency['asymmetricProperties'][0]", str(ctx.exception))
+        self.assertIn("'id'", str(ctx.exception))
+
+        base["asymmetricProperties"] = [{"id": True, "property": "knows"}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("'id'", str(ctx.exception))
+
+        base["asymmetricProperties"] = [
+            {"id": 1, "property": "knows", "extra": 2}
+        ]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=base))
+        self.assertIn("extra", str(ctx.exception))
+        self.assertIn("consistency['asymmetricProperties'][0]", str(ctx.exception))
+
+    def test_asymmetric_array_wrong_type_and_non_object_items(self):
+        with self.assertRaises(OntologyError) as ctx:
+            parse(
+                consistency_doc(
+                    consistency={
+                        "classMembershipPredicate": "rdfType",
+                        "disjointClasses": [],
+                        "functionalProperties": [],
+                        "asymmetricProperties": {},
+                    }
+                )
+            )
+        self.assertIn("asymmetricProperties", str(ctx.exception))
+
+        bad_item = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [],
+            "functionalProperties": [],
+            "asymmetricProperties": [42],
+        }
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=bad_item))
+        self.assertIn("consistency['asymmetricProperties'][0]", str(ctx.exception))
+
+    def test_asymmetric_ids_unique_across_constraint_arrays(self):
+        consistency = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [],
+            "functionalProperties": [
+                {"id": 7, "property": "knows"},
+            ],
+            "asymmetricProperties": [
+                {"id": 7, "property": "likes"},
+            ],
+        }
+        doc = consistency_doc(consistency=consistency)
+        with self.assertRaises(OntologyError) as ctx:
+            parse(doc)
+        self.assertIn("7", str(ctx.exception))
+        self.assertIn("重复", str(ctx.exception))
+
+        # 同数组内两个非对称约束 id 相同也报错
+        consistency["functionalProperties"] = []
+        consistency["asymmetricProperties"] = [
+            {"id": "same", "property": "knows"},
+            {"id": "same", "property": "likes"},
+        ]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=consistency))
+        self.assertIn("same", str(ctx.exception))
+        self.assertIn("重复", str(ctx.exception))
+
+        # 整数 7 与字符串 "7" 不重复
+        consistency["asymmetricProperties"] = [
+            {"id": "7", "property": "likes"},
+        ]
+        consistency["functionalProperties"] = [
+            {"id": 7, "property": "knows"}
+        ]
+        self.assertIsNotNone(parse(consistency_doc(consistency=consistency)))
+
 
 def consistency_doc(**overrides):
     """带类型声明与成员属性的文档。"""
@@ -1439,12 +1552,16 @@ def consistency_doc(**overrides):
     return doc
 
 
-def consistency_section(disjoint=None, functional=None, predicate="rdfType"):
-    return {
+def consistency_section(disjoint=None, functional=None, predicate="rdfType",
+                        asymmetric=None):
+    section = {
         "classMembershipPredicate": predicate,
         "disjointClasses": disjoint or [],
         "functionalProperties": functional or [],
     }
+    if asymmetric is not None:
+        section["asymmetricProperties"] = asymmetric
+    return section
 
 
 class InconsistencyDetectionTests(unittest.TestCase):
@@ -1695,6 +1812,160 @@ class InconsistencyDetectionTests(unittest.TestCase):
         )
         self.assertEqual(without.entails("alice", "knows", "bob"),
                          with_section.entails("alice", "knows", "bob"))
+
+
+class AsymmetricInconsistencyTests(unittest.TestCase):
+    """asymmetricProperties 在 parse 入口上的非对称违反检测。"""
+
+    def test_reciprocal_pair_conflict(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        message = str(ctx.exception)
+        self.assertIn("asymmetricProperties id='a1'", message)
+        self.assertIn("knows", message)
+        self.assertIn("alice", message)
+        self.assertIn("bob", message)
+        # 节点按字典序：alice 先于 bob
+        self.assertLess(message.index("'alice'"), message.index("'bob'"))
+        self.assertIn("explicit_triples", message)
+
+    def test_reflexive_triple_is_single_violation(self):
+        triples = [
+            {"subject": "carol", "predicate": "knows", "object": "carol"},
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        message = str(ctx.exception)
+        # 自反只报告一次
+        self.assertEqual(message.count("[asymmetricProperties id='a1']"), 1)
+        self.assertIn("carol", message)
+
+    def test_one_direction_is_not_a_conflict(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "likes", "object": "alice"},
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        # 反向发生在另一属性 likes 上：knows 无反向，不违反
+        model = parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(len(model.triples), 2)
+
+    def test_derived_reverse_fact_detected_with_rule_source(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-sym",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?y", "predicate": "knows", "object": "?x"}
+                ],
+            }
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(
+                consistency_doc(
+                    triples=triples, rules=rules, consistency=section
+                )
+            )
+        message = str(ctx.exception)
+        self.assertIn("derived_triples", message)
+        self.assertIn("r-sym", message)
+        self.assertIn("explicit_triples", message)
+
+    def test_unordered_pair_deduplicated(self):
+        # 重复三元组不增加冲突数：无序节点对只违反一次
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(
+            str(ctx.exception).count("[asymmetricProperties id='a1']"), 1
+        )
+
+    def test_conflicts_ordered_after_existing_kinds_and_by_property_order(self):
+        # 属性声明顺序：likes 在 knows 之前
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+            {"subject": "c", "predicate": "likes", "object": "d"},
+            {"subject": "d", "predicate": "likes", "object": "c"},
+            {"subject": "alice", "predicate": "age", "object": "1"},
+            {"subject": "alice", "predicate": "age", "object": "2"},
+        ]
+        section = consistency_section(
+            functional=[{"id": "f1", "property": "age"}],
+            asymmetric=[
+                {"id": "akn", "property": "knows"},
+                {"id": "alk", "property": "likes"},
+            ],
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(
+                consistency_doc(
+                    properties=["rdfType", "likes", "knows", "age"],
+                    triples=triples,
+                    consistency=section,
+                )
+            )
+        lines = [ln for ln in str(ctx.exception).splitlines() if ln.startswith("[")]
+        self.assertEqual(len(lines), 3)
+        # 函数型属性冲突始终在非对称冲突之前
+        self.assertIn("functionalProperties", lines[0])
+        # 非对称约束内按属性声明顺序：likes（先声明）先于 knows
+        self.assertIn("'likes'", lines[1])
+        self.assertIn("'knows'", lines[2])
+
+    def test_node_pair_lexicographic_order(self):
+        triples = [
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        message = str(ctx.exception)
+        # 即使输入顺序相反，消息中仍是 alice → bob 在前
+        arrow_alice = message.index("'alice' → 'bob'")
+        arrow_bob = message.index("'bob' → 'alice'")
+        self.assertLess(arrow_alice, arrow_bob)
+
+    def test_omitted_or_empty_asymmetric_leaves_reciprocal_facts_consistent(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+        ]
+        # 不带 asymmetricProperties：互反事实不构成冲突
+        section = consistency_section()
+        model = parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(len(model.triples), 2)
+        section = consistency_section(asymmetric=[])
+        model = parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(len(model.triples), 2)
 
 
 class DiagnoseApiTests(unittest.TestCase):
@@ -2026,6 +2297,176 @@ class DiagnoseApiTests(unittest.TestCase):
         self.assertEqual(
             OntologyEngine()(json.dumps(doc)).triples, parse(doc).triples
         )
+
+    # ---------- asymmetricProperties ----------
+
+    def test_asymmetric_diagnostic_shape_for_reciprocal_pair(self):
+        triples = [
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        self.assertFalse(report.is_consistent)
+        self.assertIsNone(report.model)
+        (diagnostic,) = report.diagnostics
+        self.assertEqual(
+            set(diagnostic),
+            {"kind", "constraintId", "subject", "evidence", "message"},
+        )
+        self.assertEqual(diagnostic["kind"], "asymmetricPropertyPair")
+        self.assertEqual(diagnostic["constraintId"], "a1")
+        self.assertEqual(diagnostic["subject"], "alice")
+        evidence = diagnostic["evidence"]
+        self.assertIsInstance(evidence, tuple)
+        self.assertEqual(len(evidence), 2)
+        for item in evidence:
+            self.assertEqual(set(item), {"subject", "object", "source"})
+        # 两项按节点字典序排列：first=alice 在前
+        self.assertEqual(
+            [(item["subject"], item["object"]) for item in evidence],
+            [("alice", "bob"), ("bob", "alice")],
+        )
+        for item in evidence:
+            self.assertEqual(item["source"], {"kind": "explicit"})
+
+    def test_asymmetric_reflexive_evidence_points_to_same_fact(self):
+        triples = [
+            {"subject": "carol", "predicate": "knows", "object": "carol"},
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": 3, "property": "knows"}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        (diagnostic,) = report.diagnostics
+        self.assertEqual(diagnostic["constraintId"], 3)
+        self.assertIsInstance(diagnostic["constraintId"], int)
+        self.assertEqual(diagnostic["subject"], "carol")
+        evidence = diagnostic["evidence"]
+        self.assertEqual(len(evidence), 2)
+        for item in evidence:
+            self.assertEqual(item["subject"], "carol")
+            self.assertEqual(item["object"], "carol")
+            self.assertEqual(item["source"], {"kind": "explicit"})
+
+    def test_asymmetric_derived_source_keeps_rule_id(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-sym",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?y", "predicate": "knows", "object": "?x"}
+                ],
+            }
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = self.diagnose(
+            consistency_doc(triples=triples, rules=rules, consistency=section)
+        )
+        (diagnostic,) = report.diagnostics
+        by_end = {
+            (item["subject"], item["object"]): item["source"]
+            for item in diagnostic["evidence"]
+        }
+        self.assertEqual(
+            by_end[("alice", "bob")], {"kind": "explicit"}
+        )
+        self.assertEqual(
+            by_end[("bob", "alice")], {"kind": "derived", "ruleId": "r-sym"}
+        )
+
+    def test_asymmetric_pairs_deduplicated_and_sorted(self):
+        triples = [
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "a", "predicate": "knows", "object": "z"},
+            {"subject": "z", "predicate": "knows", "object": "a"},
+            {"subject": "n", "predicate": "knows", "object": "n"},
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        pairs = [
+            tuple((e["subject"], e["object"]) for e in d["evidence"])
+            for d in report.diagnostics
+        ]
+        # 无序节点对去重后三对；按 (first, second) 字典序
+        self.assertEqual(
+            pairs,
+            [
+                (("a", "z"), ("z", "a")),
+                (("alice", "bob"), ("bob", "alice")),
+                (("n", "n"), ("n", "n")),
+            ],
+        )
+
+    def test_asymmetric_sort_after_existing_conflicts_matches_parse_lines(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        section = consistency_section(
+            disjoint=[{"id": "d1", "classes": ["Person", "Robot"]}],
+            asymmetric=[{"id": "a1", "property": "knows"}],
+        )
+        doc = consistency_doc(triples=triples, consistency=section)
+        text = json.dumps(doc)
+        report = OntologyEngine().diagnose(text)
+        with self.assertRaises(InconsistencyError) as ctx:
+            OntologyEngine().parse(text)
+        lines = str(ctx.exception).splitlines()
+        self.assertEqual(lines[0], f"本体一致性诊断发现 {len(report.diagnostics)} 处冲突：")
+        self.assertEqual(
+            [d["message"] for d in report.diagnostics], lines[1:]
+        )
+        kinds = [d["kind"] for d in report.diagnostics]
+        self.assertEqual(
+            kinds, ["disjointClassMembership", "asymmetricPropertyPair"]
+        )
+
+    def test_asymmetric_no_conflict_returns_inferred_model(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        section = consistency_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        self.assertTrue(report.is_consistent)
+        self.assertIsNotNone(report.model)
+        self.assertEqual(report.diagnostics, ())
+
+    def test_asymmetric_structure_error_matches_parse(self):
+        bad = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [],
+            "functionalProperties": [],
+            "asymmetricProperties": [{"id": "a1", "property": "ghost"}],
+        }
+
+        def parse_error(text):
+            with self.assertRaises(OntologyError) as ctx:
+                OntologyEngine().parse(text)
+            return str(ctx.exception)
+
+        def diagnose_error(text):
+            with self.assertRaises(OntologyError) as ctx:
+                OntologyEngine().diagnose(text)
+            return str(ctx.exception)
+
+        text = json.dumps(consistency_doc(consistency=bad))
+        self.assertEqual(diagnose_error(text), parse_error(text))
+        self.assertIn("consistency['asymmetricProperties'][0]", parse_error(text))
 
 
 def path_model():
@@ -2653,9 +3094,12 @@ def explain_doc(**overrides):
     )
 
 
-def explain_section(disjoint=None, functional=None):
+def explain_section(disjoint=None, functional=None, asymmetric=None):
     return consistency_section(
-        disjoint=disjoint, functional=functional, predicate="rdfType"
+        disjoint=disjoint,
+        functional=functional,
+        predicate="rdfType",
+        asymmetric=asymmetric,
     )
 
 
@@ -3077,6 +3521,215 @@ class ExplainDiagnosticTests(unittest.TestCase):
         report.explain_diagnostic(0)
         after = (report.is_consistent, report.model, report.diagnostics)
         self.assertEqual(before, after)
+
+    # ---------- asymmetricPropertyPair ----------
+
+    def test_asymmetric_explicit_reciprocal_proofs_follow_evidence_order(self):
+        triples = [
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        section = explain_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = diagnose_json(explain_doc(triples=triples, consistency=section))
+        result = report.explain_diagnostic(0)
+        self.assertEqual(len(result), 2)
+        # evidence 顺序为 (alice,bob) 先、(bob,alice) 后
+        ends = [
+            (e["subject"], e["object"])
+            for e in report.diagnostics[0]["evidence"]
+        ]
+        self.assertEqual(ends, [("alice", "bob"), ("bob", "alice")])
+        for proofs, (subject, object_) in zip(result, ends):
+            self.assertEqual(len(proofs), 1)
+            proof = proofs[0]
+            self.assertEqual(proof.kind, "explicit")
+            self.assertIsNone(proof.ruleId)
+            self.assertEqual(proof.premises, ())
+            self.assertEqual(proof.triple, Triple(subject, "knows", object_))
+
+    def test_asymmetric_reflexive_two_proofs_point_to_same_fact(self):
+        triples = [
+            {"subject": "carol", "predicate": "knows", "object": "carol"},
+        ]
+        section = explain_section(
+            asymmetric=[{"id": 7, "property": "knows"}]
+        )
+        report = diagnose_json(explain_doc(triples=triples, consistency=section))
+        first_proofs, second_proofs = report.explain_diagnostic(0)
+        for proofs in (first_proofs, second_proofs):
+            (proof,) = proofs
+            self.assertEqual(proof.kind, "explicit")
+            self.assertEqual(proof.triple, Triple("carol", "knows", "carol"))
+        self.assertEqual(first_proofs, second_proofs)
+
+    def test_asymmetric_derived_reverse_uses_full_rule_proof(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-sym",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?y", "predicate": "knows", "object": "?x"}
+                ],
+            }
+        ]
+        section = explain_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        first_proofs, second_proofs = report.explain_diagnostic(0)
+        # 第一项 (alice, knows, bob)：显式事实
+        self.assertEqual(len(first_proofs), 1)
+        explicit_proof = first_proofs[0]
+        self.assertEqual(explicit_proof.kind, "explicit")
+        self.assertEqual(explicit_proof.triple, Triple("alice", "knows", "bob"))
+        # 第二项 (bob, knows, alice)：规则 r-sym 的推理结论
+        self.assertEqual(len(second_proofs), 1)
+        rule_proof = second_proofs[0]
+        self.assertEqual(rule_proof.kind, "rule")
+        self.assertEqual(rule_proof.ruleId, "r-sym")
+        self.assertEqual(rule_proof.triple, Triple("bob", "knows", "alice"))
+        self.assertEqual(
+            [premise.triple for premise in rule_proof.premises],
+            [Triple("alice", "knows", "bob")],
+        )
+        self.assertTrue(all(p.kind == "explicit" for p in rule_proof.premises))
+
+    def test_asymmetric_derived_proof_matches_model_explain(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-sym",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?y", "predicate": "knows", "object": "?x"}
+                ],
+            }
+        ]
+        section = explain_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        first_proofs, second_proofs = report.explain_diagnostic(0)
+        # 去掉非对称约束后同一套事实/规则可正常 parse
+        model = parse(explain_doc(triples=triples, rules=rules))
+        self.assertEqual(
+            first_proofs, model.explain("alice", "knows", "bob")
+        )
+        self.assertEqual(
+            second_proofs, model.explain("bob", "knows", "alice")
+        )
+
+    def test_asymmetric_chained_derivation_follows_steps(self):
+        # 反向事实经两层规则推出，证明逐层追溯到显式叶子
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "k2l",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?y", "predicate": "likes", "object": "?x"}
+                ],
+            },
+            {
+                "id": "l2k",
+                "if": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+                "then": [
+                    {"subject": "?x", "predicate": "knows", "object": "?y"}
+                ],
+            },
+        ]
+        section = explain_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        _, reverse_proofs = report.explain_diagnostic(0)
+        (proof,) = reverse_proofs
+        self.assertEqual(proof.ruleId, "l2k")
+        self.assertEqual(proof.triple, Triple("bob", "knows", "alice"))
+        inner = proof.premises[0]
+        self.assertEqual(inner.ruleId, "k2l")
+        self.assertEqual(inner.triple, Triple("bob", "likes", "alice"))
+        (leaf,) = inner.premises
+        self.assertEqual(leaf.kind, "explicit")
+        self.assertEqual(leaf.triple, Triple("alice", "knows", "bob"))
+
+    def test_asymmetric_cyclic_rules_terminate_without_cyclic_proofs(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-sym",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?y", "predicate": "knows", "object": "?x"}
+                ],
+            },
+            {
+                "id": "r-sym-again",
+                "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+                "then": [
+                    {"subject": "?y", "predicate": "knows", "object": "?x"}
+                ],
+            },
+        ]
+        section = explain_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = diagnose_json(
+            explain_doc(triples=triples, rules=rules, consistency=section)
+        )
+        _, reverse_proofs = report.explain_diagnostic(0)
+        # 两条规则均一步推出反向事实，给出两个最短证明
+        self.assertEqual(
+            sorted(p.ruleId for p in reverse_proofs),
+            ["r-sym", "r-sym-again"],
+        )
+        for proof in reverse_proofs:
+            for node in iter_proof_nodes(proof):
+                self.assertEqual(
+                    sum(n.triple == node.triple for n in iter_proof_nodes(proof)),
+                    1,
+                )
+        # 重复调用同样有限结束
+        report.explain_diagnostic(0)
+
+    def test_asymmetric_index_selects_evidence_among_multiple_diagnostics(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+            {"subject": "carol", "predicate": "knows", "object": "carol"},
+        ]
+        section = explain_section(
+            asymmetric=[{"id": "a1", "property": "knows"}]
+        )
+        report = diagnose_json(explain_doc(triples=triples, consistency=section))
+        self.assertEqual(len(report.diagnostics), 2)
+        for index, diagnostic in enumerate(report.diagnostics):
+            self.assertEqual(diagnostic["kind"], "asymmetricPropertyPair")
+            result = report.explain_diagnostic(index)
+            expected = [
+                Triple(e["subject"], "knows", e["object"])
+                for e in diagnostic["evidence"]
+            ]
+            self.assertEqual(
+                [proofs[0].triple for proofs in result], expected
+            )
 
 
 class AskTests(unittest.TestCase):

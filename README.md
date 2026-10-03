@@ -83,7 +83,14 @@ DESCRIBE (?变量 ... | *) WHERE { 模式 ('.' 模式)* '.'? }
 ## 一致性诊断
 
 `OntologyEngine.parse` 在结构校验与不动点推理完成后检查 `consistency` 约束，
-发现互斥类成员或函数型属性多值冲突时抛出 `InconsistencyError`，不返回模型。
+发现互斥类成员、函数型属性多值或非对称属性反向三元组冲突时抛出
+`InconsistencyError`，不返回模型。`consistency` 除原有
+`classMembershipPredicate`、`disjointClasses`、`functionalProperties` 字段外，
+另含可选字段 `asymmetricProperties`：省略或为空数组表示不检查非对称属性；
+每项为 `{"id": ..., "property": ...}`，`id` 为非空字符串或整数（`bool` 不算）
+且同一 `consistency` 内各约束数组间不重复，`property` 必须是已声明属性。
+未知字段、类型错误、重复 `id` 或未声明属性均为结构错误，`parse` 与
+`diagnose` 都抛出带数组元素与字段定位的 `OntologyError`。
 
 `OntologyEngine.diagnose` 接受与 `parse` 相同的输入（`str` 或 UTF-8 `bytes`），
 结构、JSON、UTF-8 非法时同样抛出带定位信息的 `OntologyError`；语义冲突不抛异常，
@@ -98,9 +105,16 @@ DESCRIBE (?变量 ... | *) WHERE { 模式 ('.' 模式)* '.'? }
 每条诊断是字段固定为 `kind`、`constraintId`、`subject`、`evidence`、`message`
 的字典：
 
-- `kind` 为 `"disjointClassMembership"` 或 `"functionalPropertyValue"`；
-  前者 `evidence` 恰含 `class` 与 `source` 两项且类名按字典序排列，
-  后者恰含 `object` 与 `source` 两项且取值按字典序排列。
+- `kind` 为 `"disjointClassMembership"`、`"functionalPropertyValue"` 或
+  `"asymmetricPropertyPair"`；前两者的 `evidence` 各恰含两项：互斥类为
+  `class` 与 `source` 且类名按字典序排列，函数型属性为 `object` 与 `source`
+  且取值按字典序排列。非对称属性的 `evidence` 恰含两项，每项固定为
+  `subject`、`object`、`source`：在显式与推理三元组并集上，约束属性 `p`
+  同时存在 `(a, p, b)` 与 `(b, p, a)` 时违反一次，两项按无序节点对
+  `{a, b}` 的字典序排列（第一项 subject 较小）；`a` 等于 `b` 时 `(a, p, a)`
+  单独构成一次自反违反，两项指向同一事实。诊断按无序节点对去重，整体排在
+  互斥类与函数型属性冲突之后，新约束内按属性声明顺序、节点字典序与来源
+  稳定排序。
 - `constraintId` 保留原始字符串或整数。
 - `source` 为 `{"kind": "explicit"}`（显式事实）或
   `{"kind": "derived", "ruleId": ...}`（推理事实，`ruleId` 为原始规则 id）。
@@ -116,7 +130,10 @@ DESCRIBE (?变量 ... | *) WHERE { 模式 ('.' 模式)* '.'? }
   `classMembershipPredicate` 表达的两项类成员事实
   `(subject, classMembershipPredicate, class)`；
 - `functionalPropertyValue`：两项分别证明个体在约束属性上的两个不同取值
-  事实 `(subject, property, object)`。
+  事实 `(subject, property, object)`；
+- `asymmetricPropertyPair`：两项与 `evidence` 顺序一致，分别证明
+  `(first, property, second)` 与 `(second, property, first)` 两条反向事实；
+  自反违反时两项都证明同一事实 `(subject, property, subject)`。
 
 每项是一个 `Proof` 元组：
 

@@ -11,14 +11,17 @@
   id 为字符串或整数且不得重复；if/then 为三元组模式数组，结构与 triples 相同，
   主语/宾语可以是以 "?" 开头的变量；then 中出现的变量必须在 if 中被绑定。
 - consistency：可选对象，恰含 classMembershipPredicate、disjointClasses、
-  functionalProperties 三个字段。
+  functionalProperties 三个字段，另可含可选的 asymmetricProperties 字段
+  （省略或为空数组表示不检查非对称属性）。
 
 推理：对规则做前向链推理直至不动点。结论按 (主语, 谓语, 宾语) 字典序输出，
 同一三元组被多条规则推出时保留最先推出它的规则 id；显式三元组优先于推理结论。
 
 一致性诊断在结构校验与不动点推理完成后进行：同一个体同时属于一条
 disjointClasses 约束中的两个类、或在一条 functionalProperties 约束的属性上
-有两个不同取值，parse 抛出 InconsistencyError 且不返回模型；diagnose 不抛
+有两个不同取值、或在一条 asymmetricProperties 约束的属性上同时存在
+(a, p, b) 与 (b, p, a)（a 等于 b 时 (a, p, a) 单独构成一次自反违反），
+parse 抛出 InconsistencyError 且不返回模型；diagnose 不抛
 异常，改为返回 ValidationReport（is_consistent 为 False、model 为 None、
 diagnostics 按与异常冲突行相同的顺序列出全部两两冲突）。
 """
@@ -37,13 +40,20 @@ _TRIPLE_KEYS = frozenset({"subject", "predicate", "object"})
 _RULE_KEYS = frozenset({"id", "if", "then"})
 _VARIABLE_PREFIX = "?"
 
-_CONSISTENCY_KEYS = frozenset(
+_CONSISTENCY_REQUIRED_KEYS = frozenset(
     {"classMembershipPredicate", "disjointClasses", "functionalProperties"}
 )
+_CONSISTENCY_OPTIONAL_KEYS = frozenset({"asymmetricProperties"})
+_CONSISTENCY_ALLOWED_KEYS = _CONSISTENCY_REQUIRED_KEYS | _CONSISTENCY_OPTIONAL_KEYS
 _DISJOINT_KEYS = frozenset({"id", "classes"})
 _FUNCTIONAL_KEYS = frozenset({"id", "property"})
+_ASYMMETRIC_KEYS = frozenset({"id", "property"})
 
-# 冲突类型的稳定排序：disjointClasses 在 functionalProperties 之前。
+# 冲突诊断的排序分组：互斥类与函数型属性同属现有分组（组内按约束 id
+# 的字符串表示排序，互斥类先于函数型属性），非对称属性为新分组
+# （组内按属性声明顺序排序），整个新分组排在现成分组之后。
+_CONFLICT_GROUP_EXISTING = 0
+_CONFLICT_GROUP_ASYMMETRIC = 1
 _CONFLICT_DISJOINT = 0
 _CONFLICT_FUNCTIONAL = 1
 
@@ -88,13 +98,22 @@ class _FunctionalConstraint:
         self.property = property_
 
 
-class _Consistency:
-    __slots__ = ("membership_predicate", "disjoint", "functional")
+class _AsymmetricConstraint:
+    __slots__ = ("constraint_id", "property")
 
-    def __init__(self, membership_predicate, disjoint, functional) -> None:
+    def __init__(self, constraint_id, property_: str) -> None:
+        self.constraint_id = constraint_id
+        self.property = property_
+
+
+class _Consistency:
+    __slots__ = ("membership_predicate", "disjoint", "functional", "asymmetric")
+
+    def __init__(self, membership_predicate, disjoint, functional, asymmetric) -> None:
         self.membership_predicate = membership_predicate
         self.disjoint = disjoint
         self.functional = functional
+        self.asymmetric = asymmetric
 
 
 class OntologyEngine:
@@ -152,7 +171,12 @@ class OntologyEngine:
         evidence: Optional[List[Tuple[Triple, Triple]]] = None
         if consistency is not None:
             found = self._collect_conflicts(
-                explicit, derived, consistency, classes, individuals
+                explicit,
+                derived,
+                consistency,
+                classes,
+                individuals,
+                tuple(data["properties"]),
             )
             if found:
                 conflicts = [diagnostic for _, diagnostic, _ in found]
@@ -350,9 +374,9 @@ class OntologyEngine:
                 f"收到 {type(root).__name__}"
             )
         keys = set(root)
-        if keys != _CONSISTENCY_KEYS:
-            missing = _CONSISTENCY_KEYS - keys
-            extra = keys - _CONSISTENCY_KEYS
+        missing = _CONSISTENCY_REQUIRED_KEYS - keys
+        extra = keys - _CONSISTENCY_ALLOWED_KEYS
+        if missing or extra:
             detail = []
             if missing:
                 detail.append("缺少 " + ", ".join(sorted(missing)))
@@ -377,7 +401,10 @@ class OntologyEngine:
         functional = self._parse_functional(
             root["functionalProperties"], properties, seen_ids
         )
-        return _Consistency(predicate, disjoint, functional)
+        asymmetric = self._parse_asymmetric(
+            root.get("asymmetricProperties", []), properties, seen_ids
+        )
+        return _Consistency(predicate, disjoint, functional, asymmetric)
 
     def _claim_constraint_id(self, constraint_id, where: str, seen_ids: dict) -> None:
         if not _is_id(constraint_id):
@@ -485,6 +512,44 @@ class OntologyEngine:
             result.append(_FunctionalConstraint(item["id"], property_))
         return result
 
+    def _parse_asymmetric(self, items, properties: frozenset, seen_ids: dict):
+        if not isinstance(items, list):
+            raise OntologyError(
+                "consistency['asymmetricProperties'] 必须是对象数组，"
+                f"收到 {type(items).__name__}"
+            )
+        result = []
+        for index, item in enumerate(items):
+            where = f"consistency['asymmetricProperties'][{index}]"
+            if not isinstance(item, dict):
+                raise OntologyError(
+                    f"{where} 必须是包含 id/property 的对象，收到 {item!r}"
+                )
+            keys = set(item)
+            if keys != _ASYMMETRIC_KEYS:
+                missing = _ASYMMETRIC_KEYS - keys
+                extra = keys - _ASYMMETRIC_KEYS
+                detail = []
+                if missing:
+                    detail.append("缺少 " + ", ".join(sorted(missing)))
+                if extra:
+                    detail.append("多出 " + ", ".join(sorted(extra)))
+                raise OntologyError(f"{where} 结构不合法（{'; '.join(detail)}）")
+
+            self._claim_constraint_id(item["id"], where, seen_ids)
+
+            property_ = item["property"]
+            if not isinstance(property_, str) or not property_:
+                raise OntologyError(
+                    f"{where}['property'] 必须是非空字符串，收到 {property_!r}"
+                )
+            if property_ not in properties:
+                raise OntologyError(
+                    f"{where}['property'] 引用了未声明的属性 {property_!r}"
+                )
+            result.append(_AsymmetricConstraint(item["id"], property_))
+        return result
+
     # ---------- 前向链推理 ----------
 
     def _forward_chain(self, explicit: List[Triple], rules: List[_RulePattern]) -> Dict[Triple, object]:
@@ -549,12 +614,14 @@ class OntologyEngine:
         consistency: _Consistency,
         classes: frozenset,
         individuals: frozenset,
+        property_order: Tuple[str, ...] = (),
     ) -> List[dict]:
         """收集全部两两冲突，按与 InconsistencyError 相同的顺序排列。
 
         每项为 (排序键, 诊断字典, (证据三元组1, 证据三元组2))；证据三元组
         与诊断 evidence 两项一一对应：互斥类为 (个体, 成员谓语, 类名)，
-        函数型属性为 (个体, 约束属性, 取值)。
+        函数型属性为 (个体, 约束属性, 取值)，非对称属性为
+        (字典序较小节点, 约束属性, 字典序较大节点)；自反时两项为同一三元组。
         """
         # 全部事实的来源表：显式事实为 None，推理结论为来源规则 id。
         fact_source: Dict[Triple, Optional[object]] = {t: None for t in explicit}
@@ -572,6 +639,11 @@ class OntologyEngine:
         )
         conflicts.extend(
             self._functional_conflicts(fact_source, consistency.functional)
+        )
+        conflicts.extend(
+            self._asymmetric_conflicts(
+                fact_source, consistency.asymmetric, property_order
+            )
         )
         if not conflicts:
             return []
@@ -636,6 +708,7 @@ class OntologyEngine:
                             "message": message,
                         }
                         key = (
+                            _CONFLICT_GROUP_EXISTING,
                             str(constraint.constraint_id),
                             _CONFLICT_DISJOINT,
                             subject,
@@ -687,6 +760,7 @@ class OntologyEngine:
                             "message": message,
                         }
                         key = (
+                            _CONFLICT_GROUP_EXISTING,
                             str(constraint.constraint_id),
                             _CONFLICT_FUNCTIONAL,
                             subject,
@@ -700,6 +774,127 @@ class OntologyEngine:
                         )
                         conflicts.append((key, diagnostic, pair))
         return conflicts
+
+    def _asymmetric_conflicts(
+        self,
+        fact_source: Dict[Triple, Optional[object]],
+        constraints,
+        property_order: Tuple[str, ...],
+    ):
+        """收集非对称属性违反：(a,p,b) 与 (b,p,a) 同时存在为一次；
+        (a,p,a) 单独构成一次自反违反。按无序节点对去重。"""
+        property_rank = {name: pos for pos, name in enumerate(property_order)}
+        conflicts = []
+        for constraint in constraints:
+            property_ = constraint.property
+            # 邻接表：subject -> {object: 来源}
+            adjacency: Dict[str, Dict[str, Optional[object]]] = {}
+            for triple, source in fact_source.items():
+                if triple.predicate != property_:
+                    continue
+                adjacency.setdefault(triple.subject, {}).setdefault(
+                    triple.object, source
+                )
+            seen_pairs = set()
+            for subject, objects in adjacency.items():
+                for object_, source_ab in objects.items():
+                    if subject == object_:
+                        node_pair = (subject, subject)
+                        if node_pair in seen_pairs:
+                            continue
+                        seen_pairs.add(node_pair)
+                        src1 = source_ab
+                        src2 = source_ab
+                        self._append_asymmetric_conflict(
+                            conflicts,
+                            constraint,
+                            property_,
+                            subject,
+                            subject,
+                            src1,
+                            src2,
+                            property_rank,
+                        )
+                        continue
+                    reverse = adjacency.get(object_, {})
+                    if subject not in reverse:
+                        continue
+                    first, second = sorted((subject, object_))
+                    node_pair = (first, second)
+                    if node_pair in seen_pairs:
+                        continue
+                    seen_pairs.add(node_pair)
+                    # (first, p, second) 与 (second, p, first) 各自的来源
+                    src1 = adjacency[first][second]
+                    src2 = adjacency[second][first]
+                    self._append_asymmetric_conflict(
+                        conflicts,
+                        constraint,
+                        property_,
+                        first,
+                        second,
+                        src1,
+                        src2,
+                        property_rank,
+                    )
+        return conflicts
+
+    def _append_asymmetric_conflict(
+        self,
+        conflicts,
+        constraint,
+        property_: str,
+        first: str,
+        second: str,
+        src1,
+        src2,
+        property_rank: dict,
+    ) -> None:
+        reflexive = first == second
+        if reflexive:
+            message = (
+                f"[asymmetricProperties id={constraint.constraint_id!r}] "
+                f"非对称属性 {property_!r} 上个体 {first!r} 存在自反三元组"
+                f"（主语与宾语相同）：{first!r} 为{self._describe_source(src1)}"
+            )
+        else:
+            message = (
+                f"[asymmetricProperties id={constraint.constraint_id!r}] "
+                f"非对称属性 {property_!r} 上同时存在反向三元组 "
+                f"{first!r} → {second!r} 与 {second!r} → {first!r}："
+                f"{first!r} → {second!r} 为{self._describe_source(src1)}；"
+                f"{second!r} → {first!r} 为{self._describe_source(src2)}"
+            )
+        diagnostic = {
+            "kind": "asymmetricPropertyPair",
+            "constraintId": constraint.constraint_id,
+            "subject": first,
+            "evidence": (
+                {"subject": first, "object": second, "source": self._source_info(src1)},
+                {"subject": second, "object": first, "source": self._source_info(src2)},
+            ),
+            "message": message,
+        }
+        # 来源仅作为极端并列时的稳定次序：显式(0) 先于推理(1)，推理按 ruleId 字符串。
+        source_key = (
+            0 if src1 is None else 1,
+            "" if src1 is None else str(src1),
+            0 if src2 is None else 1,
+            "" if src2 is None else str(src2),
+        )
+        key = (
+            _CONFLICT_GROUP_ASYMMETRIC,
+            property_rank.get(property_, len(property_rank)),
+            first,
+            second,
+            str(constraint.constraint_id),
+            source_key,
+        )
+        pair = (
+            Triple(first, property_, second),
+            Triple(second, property_, first),
+        )
+        conflicts.append((key, diagnostic, pair))
 
     @staticmethod
     def _source_info(source) -> dict:
