@@ -3515,5 +3515,217 @@ class ConstructSyntaxErrorTests(unittest.TestCase):
         )
 
 
+class DescribeTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def test_basic_describe_returns_sorted_deduped_triples(self):
+        result = self.model.describe("DESCRIBE ?x WHERE { ?x knows ?y }")
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+        for triple in result:
+            self.assertIsInstance(triple, Triple)
+
+    def test_star_projection_describes_all_bound_values(self):
+        result = self.model.describe("DESCRIBE * WHERE { ?x knows ?y }")
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+
+    def test_multiple_projection_variables(self):
+        result = self.model.describe("DESCRIBE ?x ?y WHERE { ?x knows ?y }")
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+
+    def test_description_covers_subject_and_object_positions(self):
+        # 只描述 bob：主语或宾语为 bob 的三元组都入选，carol 独有的不入选
+        result = self.model.describe("DESCRIBE ?y WHERE { alice knows ?y }")
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+
+    def test_derived_triples_described_like_explicit(self):
+        # alice friendOf carol 与 alice likes bob 都是推理结论，
+        # 描述 alice 时与显式事实一样入选
+        result = self.model.describe("DESCRIBE ?x WHERE { ?x knows bob }")
+        self.assertIn(Triple("alice", "friendOf", "carol"), result)
+        self.assertIn(Triple("alice", "likes", "bob"), result)
+        self.assertIn(Triple("alice", "knows", "bob"), result)
+
+    def test_unbound_projection_variable_ignored_per_solution(self):
+        # carol 没有 likes 出边：OPTIONAL 未匹配时 ?z 未绑定并被忽略，
+        # 只有第一个解贡献名称 carol
+        result = self.model.describe(
+            "DESCRIBE ?z WHERE { ?x knows ?y . OPTIONAL { ?y likes ?z } }"
+        )
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+
+    def test_describe_with_union_filter_and_path(self):
+        result = self.model.describe("DESCRIBE ?x WHERE { ?x ^knows alice }")
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+        result = self.model.describe(
+            "DESCRIBE ?a WHERE { { ?a likes ?b } UNION { ?a friendOf ?b }"
+            " . FILTER(?a != ?b) }"
+        )
+        self.assertEqual(
+            result,
+            (
+                Triple("alice", "friendOf", "carol"),
+                Triple("alice", "knows", "bob"),
+                Triple("alice", "likes", "bob"),
+                Triple("bob", "knows", "carol"),
+                Triple("bob", "likes", "carol"),
+            ),
+        )
+
+    def test_no_match_returns_empty_tuple(self):
+        self.assertEqual(
+            self.model.describe("DESCRIBE ?x WHERE { ?x knows nobody }"),
+            (),
+        )
+        self.assertEqual(
+            self.model.describe("DESCRIBE * WHERE { ?x knows nobody }"),
+            (),
+        )
+
+    def test_describe_does_not_mutate_model_and_is_deterministic(self):
+        text = "DESCRIBE ?x WHERE { ?x knows ?y }"
+        before_explicit = self.model.explicit_triples
+        before_derived = self.model.derived_triples
+        before_all = self.model.triples
+        before_proofs = self.model.explain("alice", "friendOf", "carol")
+        first = self.model.describe(text)
+        second = self.model.describe(text)
+        self.assertEqual(first, second)
+        self.assertEqual(self.model.explicit_triples, before_explicit)
+        self.assertEqual(self.model.derived_triples, before_derived)
+        self.assertEqual(self.model.triples, before_all)
+        self.assertEqual(
+            self.model.explain("alice", "friendOf", "carol"), before_proofs
+        )
+
+
+class DescribeSyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def assertDescribeError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.describe(text)
+        for fragment in fragments:
+            self.assertIn(fragment, str(ctx.exception))
+
+    def test_non_string_input(self):
+        self.assertDescribeError(None, "str")
+        self.assertDescribeError(123, "str")
+
+    def test_empty_query(self):
+        self.assertDescribeError("", "DESCRIBE")
+        self.assertDescribeError("   ", "DESCRIBE")
+
+    def test_lowercase_keywords_rejected(self):
+        self.assertDescribeError(
+            "describe ?x WHERE { ?x knows ?y }", "DESCRIBE"
+        )
+        self.assertDescribeError(
+            "DESCRIBE ?x where { ?x knows ?y }", "只能出现变量"
+        )
+
+    def test_empty_projection_rejected(self):
+        self.assertDescribeError("DESCRIBE WHERE { ?x knows ?y }", "缺少投影")
+
+    def test_constant_projection_rejected(self):
+        self.assertDescribeError(
+            "DESCRIBE alice WHERE { ?x knows ?y }", "只能出现变量"
+        )
+
+    def test_duplicate_projection_variable_rejected(self):
+        self.assertDescribeError(
+            "DESCRIBE ?x ?x WHERE { ?x knows ?y }", "重复"
+        )
+
+    def test_star_must_stand_alone(self):
+        self.assertDescribeError(
+            "DESCRIBE * ?x WHERE { ?x knows ?y }", "未知语句成分"
+        )
+        self.assertDescribeError(
+            "DESCRIBE ?x * WHERE { ?x knows ?y }", "只能出现变量"
+        )
+
+    def test_unbalanced_braces(self):
+        self.assertDescribeError("DESCRIBE ?x WHERE ?x knows ?y }", "'{'")
+        self.assertDescribeError("DESCRIBE ?x WHERE { ?x knows ?y", "'}'")
+
+    def test_trailing_content_rejected(self):
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { ?x knows ?y } EXTRA", "未知语句成分"
+        )
+
+    def test_undeclared_property_rejected(self):
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { ?x unknown ?y }", "未声明", "unknown"
+        )
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { ?x knows/unknown+ ?y }", "未声明"
+        )
+
+    def test_subquery_and_unsupported_forms_rejected(self):
+        self.assertDescribeError(
+            "DESCRIBE ?x WHERE { SELECT ?y WHERE { ?x knows ?y } }"
+        )
+        self.assertDescribeError("DESCRIBE ?x WHERE { }", "为空")
+        self.assertDescribeError("DESCRIBE ?x WHERE { ?x knows** ?y }", "量词")
+
+    def test_legal_query_without_match_is_empty_not_error(self):
+        self.assertEqual(
+            self.model.describe("DESCRIBE ?x WHERE { ?x knows nobody }"),
+            (),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
