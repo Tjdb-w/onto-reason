@@ -4436,5 +4436,292 @@ class DescribeSyntaxErrorTests(unittest.TestCase):
         )
 
 
+class SelectSolutionModifierTests(unittest.TestCase):
+    """SELECT 解序列修饰符：ORDER BY / LIMIT / OFFSET。"""
+
+    def setUp(self):
+        self.model = query_model()
+        self.opt_model = optional_model()
+
+    def test_order_by_plain_variable_ascending(self):
+        result = self.model.query(
+            "SELECT ?y WHERE { ?x knows ?y } ORDER BY ?y"
+        )
+        self.assertEqual(result.variables, ("?y",))
+        self.assertEqual(result.rows, (("bob",), ("carol",)))
+
+    def test_order_by_desc_reverses_key(self):
+        result = self.model.query(
+            "SELECT ?y WHERE { ?x knows ?y } ORDER BY DESC(?y)"
+        )
+        self.assertEqual(result.rows, (("carol",), ("bob",)))
+        asc = self.model.query(
+            "SELECT ?y WHERE { ?x knows ?y } ORDER BY ASC(?y)"
+        )
+        self.assertEqual(asc.rows, (("bob",), ("carol",)))
+
+    def test_order_by_multiple_keys_in_appearance_order(self):
+        result = self.opt_model.query(
+            "SELECT ?x ?z WHERE { ?x knows ?y . OPTIONAL { ?y likes ?z } }"
+            " ORDER BY ?z ?x"
+        )
+        # ?z 升序（None 最先），同键再按 ?x 升序
+        self.assertEqual(
+            result.rows,
+            (
+                ("carol", None),
+                ("bob", "music"),
+                ("alice", "soccer"),
+                ("alice", "tennis"),
+            ),
+        )
+
+    def test_order_by_ties_fall_back_to_projection_lexicographic(self):
+        result = self.opt_model.query(
+            "SELECT ?y ?z WHERE { ?x knows ?y . OPTIONAL { ?y likes ?z } }"
+            " ORDER BY ?y"
+        )
+        # ?y 相同的两行保持投影字典序（soccer 在 tennis 之前）
+        self.assertEqual(
+            result.rows,
+            (
+                ("bob", "soccer"),
+                ("bob", "tennis"),
+                ("carol", "music"),
+                ("dave", None),
+            ),
+        )
+
+    def test_order_by_unbound_none_first_asc_last_desc(self):
+        text = (
+            "SELECT ?y ?e WHERE { ?x knows ?y . OPTIONAL { ?y email ?e } }"
+        )
+        asc = self.opt_model.query(text + " ORDER BY ?e")
+        self.assertEqual(
+            asc.rows,
+            (("bob", None), ("dave", None), ("carol", "c@example.com")),
+        )
+        desc = self.opt_model.query(text + " ORDER BY DESC(?e)")
+        self.assertEqual(
+            desc.rows,
+            (("carol", "c@example.com"), ("bob", None), ("dave", None)),
+        )
+
+    def test_order_by_with_star_projection(self):
+        result = self.model.query(
+            "SELECT * WHERE { ?x knows ?y } ORDER BY DESC(?y)"
+        )
+        self.assertEqual(result.variables, ("?x", "?y"))
+        self.assertEqual(result.rows, (("bob", "carol"), ("alice", "bob")))
+
+    def test_limit_truncates_after_default_lexicographic_order(self):
+        result = self.model.query("SELECT ?y WHERE { ?x knows ?y } LIMIT 1")
+        self.assertEqual(result.rows, (("bob",),))
+
+    def test_offset_skips_rows(self):
+        result = self.model.query("SELECT ?y WHERE { ?x knows ?y } OFFSET 1")
+        self.assertEqual(result.rows, (("carol",),))
+
+    def test_limit_and_offset_combined(self):
+        result = self.model.query(
+            "SELECT ?y WHERE { ?x knows ?y } LIMIT 1 OFFSET 1"
+        )
+        self.assertEqual(result.rows, (("carol",),))
+
+    def test_order_by_then_offset_then_limit(self):
+        result = self.model.query(
+            "SELECT ?y WHERE { ?x knows ?y } ORDER BY DESC(?y) LIMIT 1 OFFSET 1"
+        )
+        # 降序为 carol、bob，跳过 1 条后保留至多 1 条
+        self.assertEqual(result.rows, (("bob",),))
+
+    def test_limit_zero_returns_empty_result(self):
+        result = self.model.query("SELECT ?y WHERE { ?x knows ?y } LIMIT 0")
+        self.assertIsInstance(result, QueryResult)
+        self.assertEqual(result.variables, ("?y",))
+        self.assertEqual(result.rows, ())
+
+    def test_offset_beyond_result_size_is_empty_not_error(self):
+        result = self.model.query("SELECT ?y WHERE { ?x knows ?y } OFFSET 99")
+        self.assertEqual(result.rows, ())
+
+    def test_limit_larger_than_result_keeps_all(self):
+        result = self.model.query("SELECT ?y WHERE { ?x knows ?y } LIMIT 99")
+        self.assertEqual(result.rows, (("bob",), ("carol",)))
+
+    def test_modifiers_on_empty_match_stay_empty(self):
+        result = self.model.query(
+            "SELECT ?x WHERE { ?x knows nobody } ORDER BY ?x LIMIT 5 OFFSET 1"
+        )
+        self.assertEqual(result.variables, ("?x",))
+        self.assertEqual(result.rows, ())
+
+    def test_query_without_modifiers_unchanged(self):
+        result = self.model.query("SELECT ?y WHERE { ?x knows ?y }")
+        self.assertEqual(result.rows, (("bob",), ("carol",)))
+
+    def test_modifiers_do_not_mutate_model_and_are_stable(self):
+        text = (
+            "SELECT ?y ?z WHERE { ?x knows ?y . OPTIONAL { ?y likes ?z } }"
+            " ORDER BY DESC(?z) LIMIT 3 OFFSET 1"
+        )
+        before = (
+            self.opt_model.explicit_triples,
+            self.opt_model.derived_triples,
+            self.opt_model.triples,
+        )
+        first = self.opt_model.query(text)
+        for _ in range(3):
+            self.assertEqual(self.opt_model.query(text), first)
+        after = (
+            self.opt_model.explicit_triples,
+            self.opt_model.derived_triples,
+            self.opt_model.triples,
+        )
+        self.assertEqual(before, after)
+
+
+class SelectSolutionModifierSyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.model = query_model()
+
+    def assertQueryError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(text)
+        message = str(ctx.exception)
+        self.assertIn("字符位置", message)
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+
+    def test_order_by_missing_sort_key(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY", "缺少排序键"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY LIMIT 2", "缺少排序键"
+        )
+
+    def test_order_missing_by_keyword(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER ?x", "缺少关键字 BY"
+        )
+
+    def test_order_by_rejects_non_asc_desc_function(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY SUM(?x)",
+            "ASC/DESC",
+            "SUM",
+        )
+
+    def test_order_by_unbalanced_parentheses(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY ASC(?x", "不配对"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY ASC ?x)", "左圆括号"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY ASC()", "变量"
+        )
+
+    def test_order_by_variable_must_be_projected(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY ?y", "?y", "未在投影"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY DESC(?y)", "?y", "未在投影"
+        )
+
+    def test_order_by_variable_must_not_repeat(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY ?x ?x", "?x", "重复"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY ASC(?x) DESC(?x)",
+            "?x",
+            "重复",
+        )
+
+    def test_keyword_case_is_rejected(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } order by ?x", "大小写"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER by ?x", "大小写"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY desc(?x)", "大小写"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } Limit 1", "大小写"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } offset 1", "大小写"
+        )
+
+    def test_limit_offset_require_non_negative_integer(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } LIMIT", "缺少非负整数"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } LIMIT -1", "非负十进制整数", "-1"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } LIMIT 1.5", "非负十进制整数", "1.5"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } LIMIT true", "非负十进制整数", "true"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } OFFSET ?x", "非负十进制整数"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } LIMIT 1 OFFSET", "缺少非负整数"
+        )
+
+    def test_duplicate_or_out_of_order_modifiers(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } LIMIT 1 LIMIT 2", "重复或顺序"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } OFFSET 1 LIMIT 2", "重复或顺序"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } LIMIT 1 ORDER BY ?x", "重复或顺序"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY ?x ORDER BY ?x",
+            "重复或顺序",
+        )
+
+    def test_unknown_suffix_after_where_body(self):
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } EXTRA", "未知语句成分", "EXTRA"
+        )
+        self.assertQueryError(
+            "SELECT ?x WHERE { ?x knows ?y } ORDER BY ?x EXTRA",
+            "未知语句成分",
+            "EXTRA",
+        )
+
+    def test_ask_construct_describe_reject_modifiers(self):
+        with self.assertRaises(OntologyError):
+            self.model.ask("ASK WHERE { ?x knows ?y } LIMIT 1")
+        with self.assertRaises(OntologyError):
+            self.model.ask("ASK WHERE { ?x knows ?y } ORDER BY ?x")
+        with self.assertRaises(OntologyError):
+            self.model.construct(
+                "CONSTRUCT { ?x knows ?y } WHERE { ?x knows ?y } LIMIT 1"
+            )
+        with self.assertRaises(OntologyError):
+            self.model.construct(
+                "CONSTRUCT { ?x knows ?y } WHERE { ?x knows ?y } OFFSET 1"
+            )
+        with self.assertRaises(OntologyError):
+            self.model.describe("DESCRIBE ?x WHERE { ?x knows ?y } LIMIT 1")
+        with self.assertRaises(OntologyError):
+            self.model.describe("DESCRIBE ?x WHERE { ?x knows ?y } ORDER BY ?x")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -383,6 +383,13 @@ class OntologyModel:
         路径中的属性名必须已声明；p?/p* 的零次分支只连接三元组中实际出现
         过的节点，p+ 在环状数据上也会有限结束。OPTIONAL 与 UNION 块内同样
         可以使用属性路径；FILTER 不把路径当作比较操作数。
+        WHERE 右花括号之后还接受可选的解序列修饰符，按 ORDER BY、LIMIT、
+        OFFSET 的顺序各至多一次：排序键为投影变量 ?v、ASC(?v) 或 DESC(?v)，
+        同一排序变量只能出现一次且必须在投影中；LIMIT 与 OFFSET 只接受非负
+        十进制整数，LIMIT 省略时不截断，OFFSET 默认 0。执行时先求值、投影、
+        去重并按投影字典序排列，有 ORDER BY 时再做稳定排序（同键未绑定值
+        先于绑定值，DESC 相反；多键按出现顺序比较，全相同则回到投影字典序），
+        最后跳过 OFFSET 条并保留至多 LIMIT 条（LIMIT 0 得到空结果）。
         查询不修改模型，重复执行结果一致。词法或语法错误抛出 OntologyError。
         """
         return run_query(self, text)

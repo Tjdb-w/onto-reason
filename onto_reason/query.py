@@ -43,6 +43,17 @@
   UNION 之后的 FILTER 在所有分支合并完成后执行，可引用任一分支的变量。
 - '*' 按模式（含 OPTIONAL 块与 UNION 分支内模式）从左到右首次出现的顺序
   投影全部变量；投影变量未绑定时结果行中以 None 占位。
+- SELECT 在 WHERE 模式体右花括号之后还接受可选的解序列修饰符，按
+  ORDER BY、LIMIT、OFFSET 的顺序出现，各自至多一次：
+    SELECT (变量... | *) WHERE { 模式体 } (ORDER BY 排序键+)? (LIMIT n)? (OFFSET m)?
+  排序键为投影变量 ?v、ASC(?v)（升序，与裸变量相同）或 DESC(?v)（降序）；
+  同一排序变量只能出现一次，且必须出现在投影中（'*' 投影下为任一模式变量）。
+  LIMIT 与 OFFSET 只接受非负十进制整数；LIMIT 省略时不截断，OFFSET 默认 0。
+  执行时先按既有语义求值、投影、去重并按投影字典序排列；有 ORDER BY 时
+  在此基础上做稳定排序：同一排序键下未绑定值（None）先于绑定值，DESC
+  对该键相反；多个排序键按出现顺序比较，全部相同则回到投影字典序。
+  最后跳过 OFFSET 条并保留至多 LIMIT 条（LIMIT 0 得到空结果）。
+  ASK、CONSTRUCT、DESCRIBE 不接受这些修饰符，WHERE 花括号后仍拒绝任何后缀。
 - ASK 与 SELECT 共用同一 WHERE 模式体语法与求值语义，但不做投影：
   不接受 SELECT、变量列表或 '*'，WHERE 花括号之后也不允许任何后缀成分；
   至少存在一个满足全部条件的最终绑定时返回 True，否则返回 False。
@@ -114,6 +125,11 @@ _EXPR_BOUND = "BOUND"
 _EXPR_NOT_BOUND = "NOT_BOUND"
 _EXPR_EQ = "EQ"
 _EXPR_NE = "NE"
+
+# SELECT 解序列修饰符关键字（按允许出现的顺序）
+_MODIFIER_WORDS = ("ORDER", "LIMIT", "OFFSET")
+# ORDER BY 结构内的关键字（用于大小写校验）
+_ORDER_WORDS = ("BY", "ASC", "DESC")
 
 
 class QueryResult:
@@ -466,8 +482,52 @@ def _pending_item_pos(item) -> int:
     return item[2]
 
 
+def _tail_tokens(text: str, start: int) -> List[_Token]:
+    """对 WHERE 右花括号之后的修饰符区域做独立词法扫描。
+
+    与主词法不同：'('、')' 始终是独立 token，'?' 起变量，其余连续非空白、
+    非圆括号、非 '?' 的字符为一个单词（整数、关键字或未知成分都由解析器
+    进一步甄别）。该区域不允许字符串常量，出现 '"' 时按普通单词字符处理，
+    最终会在解析器处报未知语句成分。
+    """
+    tokens: List[_Token] = []
+    n = len(text)
+    i = start
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "?":
+            j = i + 1
+            while j < n and _is_var_char(text[j]):
+                j += 1
+            if j == i + 1:
+                raise OntologyError(
+                    f"词法错误：'?' 后必须至少跟随一个字母、数字或下划线"
+                    f"（字符位置 {i}）"
+                )
+            tokens.append(_Token(_TOK_VAR, text[i:j], i))
+            i = j
+            continue
+        if ch == "(":
+            tokens.append(_Token(_TOK_LPAREN, ch, i))
+            i += 1
+            continue
+        if ch == ")":
+            tokens.append(_Token(_TOK_RPAREN, ch, i))
+            i += 1
+            continue
+        j = i
+        while j < n and not text[j].isspace() and text[j] not in "()?":
+            j += 1
+        tokens.append(_Token(_TOK_NAME, text[i:j], i))
+        i = j
+    return tokens
+
+
 class _Parser:
-    """把 token 流编译为 (投影变量名列表, 模式子句列表, 是否星号投影)。
+    """把 token 流编译为 (投影变量名列表, 模式子句列表, 是否星号投影, 解序列修饰符)。
 
     模式子句为三元组：
     - (_CLAUSE_BGP, patterns, None)
@@ -478,6 +538,9 @@ class _Parser:
     谓语为 _Path（普通属性名是只含一个 edge 节点的路径）。
     模式序号在整个 WHERE 体内连续编号，BGP、OPTIONAL 与 UNION 分支中的
     三元组一并计数；FILTER 不占用三元组序号。
+    解序列修饰符为 (排序键元组, LIMIT 或 None, OFFSET)：排序键为
+    (变量名, 是否降序, 字符位置) 三元组；只有 SELECT 的 parse 会返回
+    非空修饰符，其余语句形态在右花括号后仍拒绝任何后缀。
     """
 
     def __init__(self, text: str, lexer: "_Lexer", properties: frozenset) -> None:
@@ -586,7 +649,7 @@ class _Parser:
         self._advance()
         return tok
 
-    def parse(self) -> Tuple[Tuple[str, ...], List[tuple], bool]:
+    def parse(self) -> Tuple[Tuple[str, ...], List[tuple], bool, tuple]:
         self._expect_keyword("SELECT")
         projection, star = self._parse_projection()
         self._expect_keyword("WHERE")
@@ -594,12 +657,11 @@ class _Parser:
             raise self._error("WHERE 后缺少左花括号 '{'", self._here_pos())
         self._advance()
         clauses = self._parse_group_body(optional=False)
-        # _parse_group_body 已消费右花括号
-        if not self._eof():
-            tok = self._peek()
-            raise self._error(f"右花括号后存在未知语句成分 {tok.value!r}", tok.pos)
+        # _parse_group_body 已消费右花括号；右花括号之后只允许解序列修饰符
+        modifiers = self._parse_solution_modifiers()
         self._validate_projection(projection, clauses)
-        return tuple(name for name, _ in projection), clauses, star
+        self._validate_order_keys(modifiers[0], projection, star, clauses)
+        return tuple(name for name, _ in projection), clauses, star, modifiers
 
     def parse_ask(self) -> List[tuple]:
         """解析 ASK WHERE { ... }，返回模式子句列表（无投影）。
@@ -1438,8 +1500,181 @@ class _Parser:
                     f"投影变量 {name} 未在任何三元组模式中出现（字符位置 {pos}）"
                 )
 
+    # ---------- SELECT 解序列修饰符（WHERE 右花括号之后） ----------
+    #
+    # 修饰符只作用于 SELECT：ORDER BY 排序键+、LIMIT 非负整数、OFFSET 非负整数，
+    # 按此顺序各自至多出现一次。右花括号之后的文本由独立的尾部词法扫描
+    # （'('、')' 是独立 token，'?' 起变量，其余连续非空白字符为单词），
+    # 不影响主词法对模式体的既有切分。
 
-def _compile_query(text, properties: frozenset) -> Tuple[Tuple[str, ...], List[tuple], bool]:
+    def _parse_solution_modifiers(self) -> tuple:
+        """解析 WHERE 右花括号之后的修饰符序列，返回 (排序键, LIMIT, OFFSET)。
+
+        排序键为 (变量名, 是否降序, 字符位置) 元组；LIMIT 缺省为 None（不截断），
+        OFFSET 缺省为 0。self._last 此时是模式体的右花括号。
+        """
+        tokens = _tail_tokens(self._text, self._last.pos + 1)
+        order_keys: List[tuple] = []
+        limit = None
+        offset = 0
+        # stage：0 可出现 ORDER，1 可出现 LIMIT，2 可出现 OFFSET，3 全部结束
+        stage = 0
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.kind == _TOK_NAME and tok.value in _MODIFIER_WORDS:
+                index = _MODIFIER_WORDS.index(tok.value)
+                if index < stage:
+                    raise OntologyError(
+                        f"修饰符 {tok.value} 重复或顺序错误：应按 ORDER BY、"
+                        f"LIMIT、OFFSET 的顺序各出现一次（字符位置 {tok.pos}）"
+                    )
+                stage = index + 1
+                if tok.value == "ORDER":
+                    order_keys, i = self._parse_order_by(tokens, i)
+                elif tok.value == "LIMIT":
+                    limit, i = self._parse_int_modifier(tokens, i)
+                else:
+                    offset, i = self._parse_int_modifier(tokens, i)
+            elif (
+                tok.kind == _TOK_NAME
+                and tok.value != tok.value.upper()
+                and tok.value.upper() in _MODIFIER_WORDS + _ORDER_WORDS
+            ):
+                raise OntologyError(
+                    f"关键字 {tok.value!r} 大小写不合规：只接受大写形式"
+                    f"（字符位置 {tok.pos}）"
+                )
+            else:
+                raise OntologyError(
+                    f"右花括号后存在未知语句成分 {tok.value!r}"
+                    f"（字符位置 {tok.pos}）"
+                )
+        return (tuple(order_keys), limit, offset)
+
+    def _parse_order_by(self, tokens: List[_Token], i: int):
+        """解析 ORDER BY 排序键列表，tokens[i] 为 ORDER；返回 (排序键, 下一索引)。"""
+        i += 1
+        if (
+            i >= len(tokens)
+            or tokens[i].kind != _TOK_NAME
+            or tokens[i].value != "BY"
+        ):
+            if (
+                i < len(tokens)
+                and tokens[i].kind == _TOK_NAME
+                and tokens[i].value.upper() == "BY"
+            ):
+                raise OntologyError(
+                    f"关键字 {tokens[i].value!r} 大小写不合规：只接受大写形式"
+                    f"（字符位置 {tokens[i].pos}）"
+                )
+            pos = tokens[i].pos if i < len(tokens) else len(self._text)
+            raise OntologyError(f"ORDER 后缺少关键字 BY（字符位置 {pos}）")
+        i += 1
+
+        keys: List[tuple] = []
+        seen = set()
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok.kind == _TOK_VAR:
+                name, descending = tok.value, False
+                i += 1
+            elif tok.kind == _TOK_NAME and tok.value in ("ASC", "DESC"):
+                func = tok
+                i += 1
+                if i >= len(tokens) or tokens[i].kind != _TOK_LPAREN:
+                    pos = tokens[i].pos if i < len(tokens) else len(self._text)
+                    raise OntologyError(
+                        f"{func.value} 后缺少左圆括号 '('（字符位置 {pos}）"
+                    )
+                i += 1
+                if i >= len(tokens) or tokens[i].kind != _TOK_VAR:
+                    pos = tokens[i].pos if i < len(tokens) else len(self._text)
+                    raise OntologyError(
+                        f"{func.value}(...) 中必须且只能出现一个变量"
+                        f"（字符位置 {pos}）"
+                    )
+                name = tokens[i].value
+                i += 1
+                if i >= len(tokens) or tokens[i].kind != _TOK_RPAREN:
+                    pos = tokens[i].pos if i < len(tokens) else len(self._text)
+                    raise OntologyError(
+                        f"{func.value}({name} 的圆括号不配对：缺少右圆括号 ')'"
+                        f"（字符位置 {pos}）"
+                    )
+                i += 1
+                descending = func.value == "DESC"
+            elif (
+                tok.kind == _TOK_NAME
+                and tok.value != tok.value.upper()
+                and tok.value.upper() in ("ASC", "DESC")
+            ):
+                raise OntologyError(
+                    f"关键字 {tok.value!r} 大小写不合规：只接受大写形式"
+                    f"（字符位置 {tok.pos}）"
+                )
+            elif (
+                tok.kind == _TOK_NAME
+                and i + 1 < len(tokens)
+                and tokens[i + 1].kind == _TOK_LPAREN
+            ):
+                raise OntologyError(
+                    f"ORDER BY 只支持 ASC/DESC 排序函数，遇到 {tok.value!r}"
+                    f"（字符位置 {tok.pos}）"
+                )
+            else:
+                break
+            if name in seen:
+                raise OntologyError(
+                    f"排序变量 {name} 重复（字符位置 {tok.pos}）"
+                )
+            seen.add(name)
+            keys.append((name, descending, tok.pos))
+        if not keys:
+            pos = tokens[i].pos if i < len(tokens) else len(self._text)
+            raise OntologyError(f"ORDER BY 后缺少排序键（字符位置 {pos}）")
+        return keys, i
+
+    def _parse_int_modifier(self, tokens: List[_Token], i: int):
+        """解析 LIMIT/OFFSET 的非负十进制整数，tokens[i] 为关键字。"""
+        word = tokens[i].value
+        i += 1
+        if i >= len(tokens):
+            raise OntologyError(
+                f"{word} 后缺少非负整数（字符位置 {len(self._text)}）"
+            )
+        tok = tokens[i]
+        if tok.kind != _TOK_NAME or not (tok.value.isascii() and tok.value.isdigit()):
+            raise OntologyError(
+                f"{word} 后必须是非负十进制整数，遇到 {tok.value!r}"
+                f"（字符位置 {tok.pos}）"
+            )
+        i += 1
+        try:
+            value = int(tok.value)
+        except ValueError:
+            raise OntologyError(
+                f"{word} 的整数超出可表示范围（字符位置 {tok.pos}）"
+            )
+        return value, i
+
+    def _validate_order_keys(self, order_keys, projection, star, clauses) -> None:
+        """排序变量必须出现在投影中（'*' 投影下为任一模式变量）。"""
+        if not order_keys:
+            return
+        if star:
+            projected = set(_star_variables(clauses))
+        else:
+            projected = {name for name, _ in projection}
+        for name, _descending, pos in order_keys:
+            if name not in projected:
+                raise OntologyError(
+                    f"排序变量 {name} 未在投影中出现（字符位置 {pos}）"
+                )
+
+
+def _compile_query(text, properties: frozenset) -> Tuple[Tuple[str, ...], List[tuple], bool, tuple]:
     if not isinstance(text, str):
         raise OntologyError(
             f"查询文本必须是 str 类型，收到 {type(text).__name__}"
@@ -1672,9 +1907,17 @@ def _eval_clauses(matcher: _PathMatcher, clauses) -> List[dict]:
 
 
 def run_query(model, text) -> QueryResult:
-    """在 model.triples 上执行查询，返回去重并按字典序排序后的 QueryResult。"""
+    """在 model.triples 上执行查询，返回应用解序列修饰符后的 QueryResult。
+
+    先按既有语义求值、投影、去重并按投影字典序排列；有 ORDER BY 时在此
+    基础上按排序键稳定排序（同键未绑定值先于绑定值，DESC 相反；多键按
+    出现顺序比较，全部相同则保留投影字典序）；最后跳过 OFFSET 条并保留
+    至多 LIMIT 条。
+    """
     properties = frozenset(getattr(model, "declared_properties", ()))
-    projection, clauses, star = _compile_query(text, properties)
+    projection, clauses, star, (order_keys, limit, offset) = _compile_query(
+        text, properties
+    )
     if star:
         projection = _star_variables(clauses)
 
@@ -1683,13 +1926,27 @@ def run_query(model, text) -> QueryResult:
 
     rows = {tuple(binding.get(name) for name in projection) for binding in bindings}
     # None（未绑定）排在所有字符串之前，保证混合取值时字典序排序稳定。
-    ordered = tuple(
-        sorted(
-            rows,
-            key=lambda row: tuple((0, "") if value is None else (1, value) for value in row),
-        )
-    )
-    return QueryResult(projection, ordered)
+    ordered = sorted(rows, key=_projection_sort_key)
+    if order_keys:
+        index = {name: i for i, name in enumerate(projection)}
+        # Python 排序稳定：从最后一个排序键开始依次排序，多键按出现顺序
+        # 生效，全部键相同的行保持此前的投影字典序。
+        for name, descending, _pos in reversed(order_keys):
+            column = index[name]
+            ordered.sort(
+                key=lambda row, c=column: _projection_sort_key((row[c],)),
+                reverse=descending,
+            )
+    if offset:
+        ordered = ordered[offset:]
+    if limit is not None:
+        ordered = ordered[:limit]
+    return QueryResult(projection, tuple(ordered))
+
+
+def _projection_sort_key(row) -> tuple:
+    """投影字典序排序键：None（未绑定）排在所有字符串之前。"""
+    return tuple((0, "") if value is None else (1, value) for value in row)
 
 
 def run_ask(model, text) -> bool:
