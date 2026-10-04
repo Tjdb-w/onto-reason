@@ -373,6 +373,19 @@ class OntologyModel:
         """执行 SPARQL 风格 SELECT 查询，在显式与推理三元组上匹配。
 
         例如 SELECT ?x ?y WHERE { ?x knows ?y . ?y likes ?z }；
+        投影除普通变量外还接受聚合项，统一写成 '(表达式 AS ?别名)'：
+        COUNT(*)、COUNT(?v)、COUNT(DISTINCT ?v)、MIN(?v)、MAX(?v)，例如
+        SELECT ?x (COUNT(*) AS ?n) (MIN(?y) AS ?lo) WHERE { ?x knows ?y }
+        GROUP BY ?x。普通变量与聚合项按任意顺序混排，输出变量严格按投影
+        顺序；出现聚合时不得使用星号，别名必须是不与普通投影变量重名的
+        新变量。可选 GROUP BY ?变量+ 位于 WHERE 之后，组键必须以普通变量
+        投影且不重复；有聚合或分组时投影中的每个普通变量都必须是组键。
+        执行时先按既有语义求值并经 FILTER 过滤，再按组键值分组：有
+        GROUP BY 时每个不同组键值一行、无解则无行；无 GROUP BY 时即使
+        没有解也产生一行（COUNT 为 0，MIN/MAX 为 None）。COUNT(*) 统计
+        组内解；COUNT(?v) 不把 ?v 未绑定的解计入；COUNT(DISTINCT ?v)
+        按绑定值去重；MIN/MAX 只比较组内已绑定字符串值并按 Unicode
+        字典序取值，无值时为 None。聚合参数变量不要求出现在模式中。
         模式体中还可以出现 OPTIONAL { ... }（左连接，无匹配时块内变量未绑定）、
         FILTER ( 表达式 )（BOUND/!BOUND 与 =/!= 比较，多个 FILTER 逻辑与）
         以及 { ... } UNION { ... }（多个花括号分支取并集，分支内仅含三元组
@@ -383,14 +396,19 @@ class OntologyModel:
         路径中的属性名必须已声明；p?/p* 的零次分支只连接三元组中实际出现
         过的节点，p+ 在环状数据上也会有限结束。OPTIONAL 与 UNION 块内同样
         可以使用属性路径；FILTER 不把路径当作比较操作数。
-        WHERE 右花括号之后还接受可选的解序列修饰符，按 ORDER BY、LIMIT、
-        OFFSET 的顺序各至多一次：排序键为投影变量 ?v、ASC(?v) 或 DESC(?v)，
-        同一排序变量只能出现一次且必须在投影中；LIMIT 与 OFFSET 只接受非负
-        十进制整数，LIMIT 省略时不截断，OFFSET 默认 0。执行时先求值、投影、
-        去重并按投影字典序排列，有 ORDER BY 时再做稳定排序（同键未绑定值
-        先于绑定值，DESC 相反；多键按出现顺序比较，全相同则回到投影字典序），
-        最后跳过 OFFSET 条并保留至多 LIMIT 条（LIMIT 0 得到空结果）。
-        查询不修改模型，重复执行结果一致。词法或语法错误抛出 OntologyError。
+        WHERE 右花括号之后还接受可选的解序列修饰符，按 GROUP BY、ORDER
+        BY、LIMIT、OFFSET 的顺序各至多一次：排序键为投影变量或聚合别名
+        ?v、ASC(?v) 或 DESC(?v)，同一排序变量只能出现一次且必须在投影中；
+        LIMIT 与 OFFSET 只接受非负十进制整数，LIMIT 省略时不截断，OFFSET
+        默认 0。结果先按投影去重并按字典序排列，有 ORDER BY 时再做稳定
+        排序（同键未绑定值先于绑定值，DESC 相反；多键按出现顺序比较，
+        全相同则回到投影字典序），最后跳过 OFFSET 条并保留至多 LIMIT 条
+        （LIMIT 0 得到空结果）。
+        查询不修改模型、推理事实或证明，重复执行结果一致。输入不是字符串、
+        查询为空、关键字小写、星号用于聚合查询、聚合参数或嵌套形式非法、
+        别名重复或与组键/投影冲突、组键未投影或重复、非组键变量混入聚合
+        投影、ORDER BY 引用未投影名称、LIMIT/OFFSET 非法，以及既有词法、
+        语法、未声明属性错误，均抛出 OntologyError；合法查询无匹配不是异常。
         """
         return run_query(self, text)
 
