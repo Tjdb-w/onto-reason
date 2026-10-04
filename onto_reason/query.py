@@ -1,9 +1,12 @@
 """SPARQL 风格基本图模式（BGP）查询，支持 OPTIONAL 左连接、FILTER 筛选、UNION 并集
-与谓语位置的属性路径。
+与谓语位置的属性路径；SELECT 额外支持 GROUP BY 分组与 COUNT/MIN/MAX 聚合。
 
 支持的语法（关键字只接受大写）：
 
-    SELECT (变量... | *) WHERE { 模式 ('.' 模式)* '.'? }
+    SELECT (投影项... | *) WHERE { 模式 ('.' 模式)* '.'? }
+           (GROUP BY 变量+)?
+           (ORDER BY 排序键+)? (LIMIT n)? (OFFSET m)?
+    投影项 := 变量 | '(' 聚合 '(' ('*' | 变量 | DISTINCT 变量) ')' AS 别名 ')'
     ASK WHERE { 模式 ('.' 模式)* '.'? }
     模式 := 三元组模式
           | OPTIONAL { 三元组模式 ('.' 三元组模式)* '.'? }
@@ -42,18 +45,39 @@
   FILTER 保持既有语义，属性路径不是合法的比较操作数。
   UNION 之后的 FILTER 在所有分支合并完成后执行，可引用任一分支的变量。
 - '*' 按模式（含 OPTIONAL 块与 UNION 分支内模式）从左到右首次出现的顺序
-  投影全部变量；投影变量未绑定时结果行中以 None 占位。
-- SELECT 在 WHERE 模式体右花括号之后还接受可选的解序列修饰符，按
-  ORDER BY、LIMIT、OFFSET 的顺序出现，各自至多一次：
-    SELECT (变量... | *) WHERE { 模式体 } (ORDER BY 排序键+)? (LIMIT n)? (OFFSET m)?
-  排序键为投影变量 ?v、ASC(?v)（升序，与裸变量相同）或 DESC(?v)（降序）；
-  同一排序变量只能出现一次，且必须出现在投影中（'*' 投影下为任一模式变量）。
+  投影全部变量；投影变量未绑定时结果行中以 None 占位。出现聚合时不得
+  使用星号，星号也不得与任何投影项混写。
+- SELECT 投影除普通变量外还接受聚合项，统一写成
+  (表达式 AS ?别名)：COUNT(*)、COUNT(?v)、COUNT(DISTINCT ?v)、
+  MIN(?v)、MAX(?v)。别名必须是新变量，不得与普通投影变量或其它别名
+  重复；聚合参数只能是单个变量（COUNT 额外允许 '*'），不接受嵌套形式。
+  含聚合或分组时，投影中的普通变量必须全部出现在 GROUP BY 中。
+- GROUP BY ?变量+ 可选，位于 WHERE 右花括号之后、ORDER BY/LIMIT/OFFSET
+  之前，至多一次；组键互不重复，且必须以普通变量（而非聚合别名）出现在
+  投影中。输出变量按投影顺序由组键与聚合别名构成。
+- 执行时先按既有语义求值并过滤全部最终绑定，再按组键值（未绑定为 None，
+  同样参与分组）分组，最后计算各组聚合：COUNT(*) 统计组内解数，
+  COUNT(?v) 不计 ?v 未绑定的解，COUNT(DISTINCT ?v) 在已绑定值上按取值
+  去重后计数；MIN/MAX 只比较组内已绑定的字符串值并按 Unicode 字典序取
+  极值，组内无已绑定值时为 None。无 GROUP BY 时全体解构成唯一一组，
+  即使没有解也产生一行（COUNT 为 0，MIN/MAX 为 None）；有 GROUP BY 而
+  无解时不输出任何行。聚合结果先按投影取值去重并按投影字典序排序，再
+  进入 ORDER BY、LIMIT、OFFSET。
+- SELECT 在 WHERE 模式体右花括号之后先接受可选 GROUP BY，再接受可选的
+  解序列修饰符，按 ORDER BY、LIMIT、OFFSET 的顺序出现，各自至多一次：
+    SELECT (投影项... | *) WHERE { 模式体 } (GROUP BY 变量+)?
+      (ORDER BY 排序键+)? (LIMIT n)? (OFFSET m)?
+  排序键为投影变量或聚合别名 ?v、ASC(?v)（升序，与裸变量相同）或
+  DESC(?v)（降序）；同一排序变量只能出现一次，且必须出现在投影中
+  （普通查询的 '*' 投影下为任一模式变量）。
   LIMIT 与 OFFSET 只接受非负十进制整数；LIMIT 省略时不截断，OFFSET 默认 0。
-  执行时先按既有语义求值、投影、去重并按投影字典序排列；有 ORDER BY 时
-  在此基础上做稳定排序：同一排序键下未绑定值（None）先于绑定值，DESC
-  对该键相反；多个排序键按出现顺序比较，全部相同则回到投影字典序。
+  执行时先求值（含聚合时先分组求聚合）、去重并按投影字典序排列；有
+  ORDER BY 时在此基础上做稳定排序：同一排序键下未绑定值（None）先于
+  绑定值，DESC 对该键相反；多个排序键按出现顺序比较，全部相同则回到
+  投影字典序。
   最后跳过 OFFSET 条并保留至多 LIMIT 条（LIMIT 0 得到空结果）。
-  ASK、CONSTRUCT、DESCRIBE 不接受这些修饰符，WHERE 花括号后仍拒绝任何后缀。
+  ASK、CONSTRUCT、DESCRIBE 不接受 GROUP BY 与这些修饰符，WHERE 花括号
+  后仍拒绝任何后缀。
 - ASK 与 SELECT 共用同一 WHERE 模式体语法与求值语义，但不做投影：
   不接受 SELECT、变量列表或 '*'，WHERE 花括号之后也不允许任何后缀成分；
   至少存在一个满足全部条件的最终绑定时返回 True，否则返回 False。
@@ -128,8 +152,10 @@ _EXPR_NE = "NE"
 
 # SELECT 解序列修饰符关键字（按允许出现的顺序）
 _MODIFIER_WORDS = ("ORDER", "LIMIT", "OFFSET")
-# ORDER BY 结构内的关键字（用于大小写校验）
+# ORDER BY / GROUP BY 结构内的关键字（用于大小写校验）
 _ORDER_WORDS = ("BY", "ASC", "DESC")
+# WHERE 右花括号之后允许出现的全部子句关键字（含 GROUP BY）
+_CLAUSE_WORDS = ("GROUP", "ORDER", "LIMIT", "OFFSET")
 
 
 class QueryResult:
@@ -274,6 +300,7 @@ def _skip_string(text: str, start: int) -> int:
 
 _MODE_NORMAL = "normal"
 _MODE_PATH = "path"
+_MODE_HEAD = "head"
 
 # 路径模式下切分名称的定界符：空白与全部路径/模式结构字符；
 # '!'、'=' 在路径模式下仍允许出现在名称里（FILTER 语义不会进入谓语槽）。
@@ -332,6 +359,8 @@ class _Lexer:
         ch = text[i]
         if self.mode == _MODE_PATH:
             return self._next_path(i, ch, text, n)
+        if self.mode == _MODE_HEAD:
+            return self._next_head(i, ch, text, n)
         return self._next_normal(i, ch, text, n)
 
     def _next_normal(self, i: int, ch: str, text: str, n: int) -> _Token:
@@ -428,6 +457,40 @@ class _Lexer:
         self.pos = j
         return _Token(_TOK_NAME, text[start:j], start)
 
+    def _next_head(self, i: int, ch: str, text: str, n: int) -> _Token:
+        """SELECT 头部（投影与 GROUP BY）词法。
+
+        '('、')' 始终是独立 token（聚合调用），'?' 起变量，'*' 是 STAR
+        （聚合参数位置才合法，投影位置出现单独的 '*' 仍按旧规则消费并由
+        解析器拒绝聚合查询下的星号），双引号产出 STRING（头部不允许，由
+        解析器按未知成分拒绝）；其余连续非空白、非结构字符切为一个单词，
+        聚合函数名、AS、GROUP/BY 与变量以外的内容都交由解析器甄别。
+        """
+        simple = {"(": _TOK_LPAREN, ")": _TOK_RPAREN, "*": _TOK_STAR,
+                  "{": _TOK_LBRACE, "}": _TOK_RBRACE}
+        if ch in simple:
+            self.pos = i + 1
+            return _Token(simple[ch], ch, i)
+        if ch == "?":
+            j = i + 1
+            while j < n and _is_var_char(text[j]):
+                j += 1
+            if j == i + 1:
+                raise OntologyError(
+                    f"词法错误：'?' 后必须至少跟随一个字母、数字或下划线"
+                    f"（字符位置 {i}）"
+                )
+            self.pos = j
+            return _Token(_TOK_VAR, text[i:j], i)
+        if ch == '"':
+            return self._next_string(i, text, n)
+        start = i
+        j = i
+        while j < n and not text[j].isspace() and text[j] not in "()*?{}":
+            j += 1
+        self.pos = j
+        return _Token(_TOK_NAME, text[start:j], start)
+
     def _next_string(self, i: int, text: str, n: int) -> _Token:
         start = i
         j = i + 1
@@ -485,10 +548,10 @@ def _pending_item_pos(item) -> int:
 def _tail_tokens(text: str, start: int) -> List[_Token]:
     """对 WHERE 右花括号之后的修饰符区域做独立词法扫描。
 
-    与主词法不同：'('、')' 始终是独立 token，'?' 起变量，其余连续非空白、
-    非圆括号、非 '?' 的字符为一个单词（整数、关键字或未知成分都由解析器
-    进一步甄别）。该区域不允许字符串常量，出现 '"' 时按普通单词字符处理，
-    最终会在解析器处报未知语句成分。
+    与主词法不同：'('、')' 始终是独立 token，'?' 起变量，'*' 也是独立
+    token，其余连续非空白、非圆括号、非 '?'/'*' 的字符为一个单词（整数、
+    关键字或未知成分都由解析器进一步甄别）。该区域不允许字符串常量，
+    出现 '"' 时按普通单词字符处理，最终会在解析器处报未知语句成分。
     """
     tokens: List[_Token] = []
     n = len(text)
@@ -518,8 +581,12 @@ def _tail_tokens(text: str, start: int) -> List[_Token]:
             tokens.append(_Token(_TOK_RPAREN, ch, i))
             i += 1
             continue
+        if ch == "*":
+            tokens.append(_Token(_TOK_STAR, ch, i))
+            i += 1
+            continue
         j = i
-        while j < n and not text[j].isspace() and text[j] not in "()?":
+        while j < n and not text[j].isspace() and text[j] not in "()?*":
             j += 1
         tokens.append(_Token(_TOK_NAME, text[i:j], i))
         i = j
@@ -649,19 +716,40 @@ class _Parser:
         self._advance()
         return tok
 
-    def parse(self) -> Tuple[Tuple[str, ...], List[tuple], bool, tuple]:
+    def parse(self):
+        # SELECT 头部（SELECT、投影、WHERE）按头部词法切分：'('、')' 成为
+        # 独立 token，使 (聚合 AS ?别名) 可解析；读到 WHERE 后的左花括号时
+        # 再回退并恢复普通词法，模式体词法与旧行为完全一致。
+        self._lexer.set_mode(_MODE_HEAD)
+        self._lexer.rewind(0)
+        self._queue.clear()
         self._expect_keyword("SELECT")
-        projection, star = self._parse_projection()
+        projection, star, has_aggregate = self._parse_projection()
         self._expect_keyword("WHERE")
         if self._eof() or self._peek().kind != _TOK_LBRACE:
             raise self._error("WHERE 后缺少左花括号 '{'", self._here_pos())
+        lbrace_pos = self._peek().pos
+        # 模式体恢复普通词法：从左花括号起重新切分
+        self._lexer.set_mode(_MODE_NORMAL)
+        self._lexer.rewind(lbrace_pos)
+        self._queue.clear()
         self._advance()
         clauses = self._parse_group_body(optional=False)
-        # _parse_group_body 已消费右花括号；右花括号之后只允许解序列修饰符
-        modifiers = self._parse_solution_modifiers()
-        self._validate_projection(projection, clauses)
+        # _parse_group_body 已消费右花括号；右花括号之后允许 GROUP BY 与
+        # 解序列修饰符
+        modifiers, group_keys = self._parse_solution_modifiers()
+        self._validate_projection(
+            projection, star, has_aggregate, group_keys, clauses
+        )
         self._validate_order_keys(modifiers[0], projection, star, clauses)
-        return tuple(name for name, _ in projection), clauses, star, modifiers
+        return (
+            tuple(projection),
+            clauses,
+            star,
+            has_aggregate,
+            group_keys,
+            modifiers,
+        )
 
     def parse_ask(self) -> List[tuple]:
         """解析 ASK WHERE { ... }，返回模式子句列表（无投影）。
@@ -854,38 +942,207 @@ class _Parser:
             raise self._error("DESCRIBE 后缺少投影变量或 '*'", self._here_pos())
         return names, False
 
-    def _parse_projection(self) -> Tuple[List[Tuple[str, int]], bool]:
+    # SELECT 头部支持的聚合函数（统一以 (表达式 AS ?别名) 形式投影）
+    _AGG_WORDS = ("COUNT", "MIN", "MAX")
+
+    def _parse_projection(self):
+        """解析 SELECT 投影，返回 (投影项列表, 是否星号, 是否出现聚合)。
+
+        投影项为 ("var", 变量名, 位置, None) 或
+        ("agg", 别名, 别名位置, 聚合描述)；聚合描述为
+        (函数名, 是否 DISTINCT, 参数, 参数位置)，参数为 None 表示 '*'，
+        否则为 ("var", 变量名)。星号只能单独出现且不得与聚合混用。
+        """
         if self._eof():
             raise self._error("SELECT 后缺少投影变量或 '*'", len(self._text))
         if self._peek().kind == _TOK_STAR:
+            star_tok = self._peek()
             self._advance()
             # '*' 后必须紧跟 WHERE
             if self._eof() or self._peek().kind != _TOK_NAME or self._peek().value != "WHERE":
                 raise self._error("'*' 与 WHERE 之间存在未知语句成分", self._here_pos())
-            return [], True
+            return [], True, False
 
-        names: List[Tuple[str, int]] = []
+        items: List[tuple] = []
+        # 已占用的投影名（普通变量与聚合别名），用于重复与“别名必须是新变量”校验
         seen = set()
+        has_aggregate = False
         while not self._eof():
             tok = self._peek()
             if tok.kind == _TOK_NAME and tok.value == "WHERE":
                 break
-            if tok.kind != _TOK_VAR:
+            if tok.kind == _TOK_STAR:
                 raise self._error(
-                    f"SELECT 后只能出现变量或 '*'，遇到未知语句成分 {tok.value!r}",
+                    "星号 '*' 只能作为唯一投影出现；含聚合的 SELECT 不得使用星号",
                     tok.pos,
                 )
-            if tok.value in seen:
+            if tok.kind == _TOK_VAR:
+                if tok.value in seen:
+                    raise self._error(
+                        f"投影变量 {tok.value} 重复（字符位置 {tok.pos}）",
+                        tok.pos,
+                    )
+                seen.add(tok.value)
+                items.append(("var", tok.value, tok.pos, None))
+                self._advance()
+                continue
+            if tok.kind == _TOK_LPAREN:
+                agg_item = self._parse_aggregate_item(seen)
+                seen.add(agg_item[1])
+                items.append(agg_item)
+                has_aggregate = True
+                continue
+            if tok.kind == _TOK_NAME and self._is_lowercase_head_keyword(tok.value):
                 raise self._error(
-                    f"投影变量 {tok.value} 重复（字符位置 {tok.pos}）",
+                    f"关键字 {tok.value!r} 大小写不合规：只接受大写形式",
                     tok.pos,
                 )
-            seen.add(tok.value)
-            names.append((tok.value, tok.pos))
-            self._advance()
-        if not names:
+            raise self._error(
+                f"SELECT 后只能出现变量、'*' 或 (聚合表达式 AS ?别名)，"
+                f"遇到未知语句成分 {tok.value!r}",
+                tok.pos,
+            )
+        if not items:
             raise self._error("SELECT 后缺少投影变量或 '*'", self._here_pos())
-        return names, False
+        return items, False, has_aggregate
+
+    def _is_lowercase_head_keyword(self, word: str) -> bool:
+        return (
+            word != word.upper()
+            and word.upper()
+            in self._AGG_WORDS + ("DISTINCT", "AS", "GROUP", "BY", "WHERE")
+        )
+
+    def _parse_aggregate_item(self, seen: set) -> tuple:
+        """解析一个 (聚合(参数) AS ?别名) 投影项，左圆括号为当前 token。"""
+        lparen = self._peek()
+        self._advance()
+        if self._eof() or self._peek().kind != _TOK_NAME:
+            pos = self._peek().pos if not self._eof() else lparen.pos
+            raise self._error(
+                "括号投影项必须以聚合函数 COUNT、MIN 或 MAX 开头",
+                pos,
+            )
+        func = self._peek()
+        if func.kind == _TOK_NAME and self._is_lowercase_head_keyword(func.value):
+            raise self._error(
+                f"关键字 {func.value!r} 大小写不合规：只接受大写形式",
+                func.pos,
+            )
+        if func.value not in self._AGG_WORDS:
+            raise self._error(
+                f"不支持的聚合函数 {func.value!r}：只支持 COUNT、MIN、MAX，"
+                f"且聚合项必须写成 (表达式 AS ?别名)",
+                func.pos,
+            )
+        self._advance()
+        # 函数名后紧跟 '('
+        if self._eof() or self._peek().kind != _TOK_LPAREN:
+            raise self._error(
+                f"聚合函数 {func.value} 后缺少左圆括号 '('",
+                self._here_pos(),
+            )
+        self._advance()
+        distinct = False
+        # 参数：只有 COUNT 接受 DISTINCT 修饰；COUNT 允许 '*'，其余只允许变量
+        if not self._eof() and self._peek().kind == _TOK_NAME and self._peek().value == "DISTINCT":
+            if func.value != "COUNT":
+                bad = self._peek()
+                raise self._error(
+                    f"聚合函数 {func.value} 不接受 DISTINCT 修饰"
+                    f"（只有 COUNT(DISTINCT ?v) 合法，字符位置 {bad.pos}）",
+                    bad.pos,
+                )
+            distinct = True
+            self._advance()
+        elif (
+            not self._eof()
+            and self._peek().kind == _TOK_NAME
+            and self._peek().value != self._peek().value.upper()
+            and self._peek().value.upper() == "DISTINCT"
+        ):
+            bad = self._peek()
+            raise self._error(
+                f"关键字 {bad.value!r} 大小写不合规：只接受大写形式",
+                bad.pos,
+            )
+        arg_tok = self._peek() if not self._eof() else None
+        if arg_tok is not None and arg_tok.kind == _TOK_STAR:
+            if func.value != "COUNT":
+                raise self._error(
+                    f"聚合函数 {func.value} 的参数只能是单个变量，不支持 '*'",
+                    arg_tok.pos,
+                )
+            if distinct:
+                raise self._error(
+                    "COUNT(*) 不接受 DISTINCT 修饰",
+                    arg_tok.pos,
+                )
+            arg = None
+            arg_pos = arg_tok.pos
+            self._advance()
+        elif arg_tok is not None and arg_tok.kind == _TOK_VAR:
+            arg = ("var", arg_tok.value)
+            arg_pos = arg_tok.pos
+            self._advance()
+        else:
+            pos = arg_tok.pos if arg_tok is not None else len(self._text)
+            shown = arg_tok.value if arg_tok is not None else ""
+            raise self._error(
+                f"聚合函数 {func.value} 的参数非法：需要单个变量"
+                f"（COUNT 额外允许 '*'），遇到 {shown!r}",
+                pos,
+            )
+        # 参数之后必须是 ')'，拒绝多余参数、DISTINCT 错位与嵌套形式
+        if self._eof() or self._peek().kind != _TOK_RPAREN:
+            bad = self._peek() if not self._eof() else None
+            pos = bad.pos if bad is not None else len(self._text)
+            raise self._error(
+                f"聚合函数 {func.value} 只接受单个参数且不允许嵌套形式，"
+                f"参数后缺少右圆括号 ')'",
+                pos,
+            )
+        self._advance()
+        # AS
+        if self._eof() or self._peek().kind != _TOK_NAME or self._peek().value != "AS":
+            bad = self._peek() if not self._eof() else None
+            if bad is not None and bad.kind == _TOK_NAME and self._is_lowercase_head_keyword(bad.value):
+                raise self._error(
+                    f"关键字 {bad.value!r} 大小写不合规：只接受大写形式",
+                    bad.pos,
+                )
+            pos = bad.pos if bad is not None else len(self._text)
+            raise self._error(
+                f"聚合表达式后缺少关键字 AS 与别名 ?变量（字符位置 {pos}）",
+                pos,
+            )
+        self._advance()
+        if self._eof() or self._peek().kind != _TOK_VAR:
+            bad = self._peek() if not self._eof() else None
+            pos = bad.pos if bad is not None else len(self._text)
+            shown = bad.value if bad is not None else ""
+            raise self._error(
+                f"AS 后必须是新的别名变量，遇到 {shown!r}",
+                pos,
+            )
+        alias = self._peek()
+        self._advance()
+        if alias.value in seen:
+            raise self._error(
+                f"聚合别名 {alias.value} 与已有投影变量或别名重复"
+                f"（别名必须是新变量，字符位置 {alias.pos}）",
+                alias.pos,
+            )
+        if self._eof() or self._peek().kind != _TOK_RPAREN:
+            bad = self._peek() if not self._eof() else None
+            pos = bad.pos if bad is not None else len(self._text)
+            raise self._error(
+                f"聚合投影项缺少右圆括号 ')'（别名 {alias.value} 之后）",
+                pos,
+            )
+        self._advance()
+        return ("agg", alias.value, alias.pos, (func.value, distinct, arg, arg_pos))
+
 
     def _parse_group_body(self, optional: bool) -> List[tuple]:
         """解析 '{' 之后直到匹配 '}' 的模式组，返回子句列表（已消费 '}'）。"""
@@ -1488,39 +1745,74 @@ class _Parser:
                 tok.pos,
             )
 
-    def _validate_projection(self, projection, clauses) -> None:
+    def _validate_projection(
+        self, projection, star, has_aggregate, group_keys, clauses
+    ) -> None:
         used = set()
         for s, _p, o in _all_patterns(clauses):
             for item in (s, o):
                 if item[0] == _VAR:
                     used.add(item[1])
-        for name, pos in projection:
-            if name not in used:
+        # 普通变量投影必须出现在模式中；聚合别名是新变量，不做此校验。
+        for kind, name, pos, agg in projection:
+            if kind == "var" and name not in used:
                 raise OntologyError(
                     f"投影变量 {name} 未在任何三元组模式中出现（字符位置 {pos}）"
                 )
+        group_names = [name for name, _pos in group_keys]
+        group_set = set(group_names)
+        if group_keys:
+            # 组键必须以普通变量投影（不能是聚合别名）
+            plain_vars = {
+                name for kind, name, _p, _a in projection if kind == "var"
+            }
+            for name, pos in group_keys:
+                if name not in plain_vars:
+                    raise OntologyError(
+                        f"GROUP BY 组键 {name} 必须作为普通变量出现在投影中，"
+                        f"不能是聚合别名（字符位置 {pos}）"
+                    )
+        if has_aggregate or group_keys:
+            # 分组或聚合投影中的普通变量必须全部是组键；组键重复已在
+            # GROUP BY 解析时拒绝，别名与组键冲突在投影解析时按别名重复拒绝。
+            for kind, name, pos, agg in projection:
+                if kind == "var" and name not in group_set:
+                    raise OntologyError(
+                        f"聚合投影中的普通变量 {name} 必须出现在 GROUP BY 中"
+                        f"（字符位置 {pos}）"
+                    )
 
-    # ---------- SELECT 解序列修饰符（WHERE 右花括号之后） ----------
+    # ---------- SELECT 分组与解序列修饰符（WHERE 右花括号之后） ----------
     #
-    # 修饰符只作用于 SELECT：ORDER BY 排序键+、LIMIT 非负整数、OFFSET 非负整数，
-    # 按此顺序各自至多出现一次。右花括号之后的文本由独立的尾部词法扫描
-    # （'('、')' 是独立 token，'?' 起变量，其余连续非空白字符为单词），
-    # 不影响主词法对模式体的既有切分。
+    # 只作用于 SELECT：可选 GROUP BY ?变量+ 在前，其后按 ORDER BY、LIMIT、
+    # OFFSET 的顺序各自至多出现一次。右花括号之后的文本由独立的尾部词法
+    # 扫描（'('、')'、'*' 是独立 token，'?' 起变量，其余连续非空白字符为
+    # 单词），不影响主词法对模式体的既有切分。
 
-    def _parse_solution_modifiers(self) -> tuple:
-        """解析 WHERE 右花括号之后的修饰符序列，返回 (排序键, LIMIT, OFFSET)。
+    def _parse_solution_modifiers(self):
+        """解析 WHERE 右花括号之后的 GROUP BY 与修饰符序列。
 
-        排序键为 (变量名, 是否降序, 字符位置) 元组；LIMIT 缺省为 None（不截断），
-        OFFSET 缺省为 0。self._last 此时是模式体的右花括号。
+        返回 ((排序键, LIMIT, OFFSET), 组键元组)。排序键为
+        (变量名, 是否降序, 字符位置)；组键为 (变量名, 字符位置)；
+        LIMIT 缺省为 None（不截断），OFFSET 缺省 0。self._last 是右花括号。
         """
         tokens = _tail_tokens(self._text, self._last.pos + 1)
+        group_keys: List[tuple] = []
         order_keys: List[tuple] = []
         limit = None
         offset = 0
+        i = 0
+        n_tokens = len(tokens)
+        # 可选 GROUP BY ?变量+，必须位于所有解序列修饰符之前
+        if (
+            i < n_tokens
+            and tokens[i].kind == _TOK_NAME
+            and tokens[i].value == "GROUP"
+        ):
+            group_keys, i = self._parse_group_by(tokens, i)
         # stage：0 可出现 ORDER，1 可出现 LIMIT，2 可出现 OFFSET，3 全部结束
         stage = 0
-        i = 0
-        while i < len(tokens):
+        while i < n_tokens:
             tok = tokens[i]
             if tok.kind == _TOK_NAME and tok.value in _MODIFIER_WORDS:
                 index = _MODIFIER_WORDS.index(tok.value)
@@ -1539,18 +1831,74 @@ class _Parser:
             elif (
                 tok.kind == _TOK_NAME
                 and tok.value != tok.value.upper()
-                and tok.value.upper() in _MODIFIER_WORDS + _ORDER_WORDS
+                and tok.value.upper() in _CLAUSE_WORDS + _ORDER_WORDS
             ):
                 raise OntologyError(
                     f"关键字 {tok.value!r} 大小写不合规：只接受大写形式"
                     f"（字符位置 {tok.pos}）"
+                )
+            elif tok.kind == _TOK_NAME and tok.value == "GROUP":
+                raise OntologyError(
+                    f"GROUP BY 重复或位置错误：至多出现一次且必须位于 "
+                    f"ORDER BY、LIMIT、OFFSET 之前（字符位置 {tok.pos}）"
                 )
             else:
                 raise OntologyError(
                     f"右花括号后存在未知语句成分 {tok.value!r}"
                     f"（字符位置 {tok.pos}）"
                 )
-        return (tuple(order_keys), limit, offset)
+        return (tuple(order_keys), limit, offset), tuple(group_keys)
+
+    def _parse_group_by(self, tokens: List[_Token], i: int):
+        """解析 GROUP BY ?变量+，tokens[i] 为 GROUP；返回 (组键, 下一索引)。"""
+        i += 1
+        if i >= len(tokens) or tokens[i].kind != _TOK_NAME or tokens[i].value != "BY":
+            if (
+                i < len(tokens)
+                and tokens[i].kind == _TOK_NAME
+                and tokens[i].value.upper() == "BY"
+            ):
+                raise OntologyError(
+                    f"关键字 {tokens[i].value!r} 大小写不合规：只接受大写形式"
+                    f"（字符位置 {tokens[i].pos}）"
+                )
+            pos = tokens[i].pos if i < len(tokens) else len(self._text)
+            raise OntologyError(f"GROUP 后缺少关键字 BY（字符位置 {pos}）")
+        i += 1
+        keys: List[tuple] = []
+        seen = set()
+        while i < len(tokens) and tokens[i].kind == _TOK_VAR:
+            tok = tokens[i]
+            if tok.value in seen:
+                raise OntologyError(
+                    f"GROUP BY 组键 {tok.value} 重复（字符位置 {tok.pos}）"
+                )
+            seen.add(tok.value)
+            keys.append((tok.value, tok.pos))
+            i += 1
+        if not keys:
+            if i < len(tokens):
+                tok = tokens[i]
+                raise OntologyError(
+                    f"GROUP BY 后必须出现一个或多个不重复的变量，"
+                    f"遇到 {tok.value!r}（字符位置 {tok.pos}）"
+                )
+            raise OntologyError(
+                f"GROUP BY 后缺少组键变量（字符位置 {len(self._text)}）"
+            )
+        # 变量之后若紧跟括号/星号残留则在这里拒绝；其它非修饰符成分交由
+        # 主循环按未知语句成分报错。
+        if i < len(tokens) and tokens[i].kind in (
+            _TOK_LPAREN,
+            _TOK_RPAREN,
+            _TOK_STAR,
+        ):
+            tok = tokens[i]
+            raise OntologyError(
+                f"GROUP BY 只接受变量作为组键，遇到 {tok.value!r}"
+                f"（字符位置 {tok.pos}）"
+            )
+        return keys, i
 
     def _parse_order_by(self, tokens: List[_Token], i: int):
         """解析 ORDER BY 排序键列表，tokens[i] 为 ORDER；返回 (排序键, 下一索引)。"""
@@ -1666,7 +2014,7 @@ class _Parser:
         if star:
             projected = set(_star_variables(clauses))
         else:
-            projected = {name for name, _ in projection}
+            projected = {item[1] for item in projection}
         for name, _descending, pos in order_keys:
             if name not in projected:
                 raise OntologyError(
@@ -1909,26 +2257,45 @@ def _eval_clauses(matcher: _PathMatcher, clauses) -> List[dict]:
 def run_query(model, text) -> QueryResult:
     """在 model.triples 上执行查询，返回应用解序列修饰符后的 QueryResult。
 
-    先按既有语义求值、投影、去重并按投影字典序排列；有 ORDER BY 时在此
-    基础上按排序键稳定排序（同键未绑定值先于绑定值，DESC 相反；多键按
-    出现顺序比较，全部相同则保留投影字典序）；最后跳过 OFFSET 条并保留
-    至多 LIMIT 条。
+    普通 SELECT 先按既有语义求值、投影、去重并按投影字典序排列。含聚合或
+    GROUP BY 时先对全部最终绑定按组键值分组（无 GROUP BY 时全体解为一组，
+    即使无解也产生一行），再按投影顺序计算各聚合项；组键取绑定值（未绑定
+    为 None），COUNT 统计组内解数（COUNT(?v) 不计未绑定，DISTINCT 按绑定
+    值去重），MIN/MAX 取组内已绑定字符串值的 Unicode 字典序极值，无值为
+    None；有 GROUP BY 而无解时不产生行。聚合结果同样先按投影去重并按投影
+    字典序排列。
+    有 ORDER BY 时在此基础上按排序键稳定排序（同键未绑定值先于绑定值，
+    DESC 相反；多键按出现顺序比较，全部相同则保留投影字典序）；最后跳过
+    OFFSET 条并保留至多 LIMIT 条。
     """
     properties = frozenset(getattr(model, "declared_properties", ()))
-    projection, clauses, star, (order_keys, limit, offset) = _compile_query(
-        text, properties
-    )
+    (
+        projection_items,
+        clauses,
+        star,
+        has_aggregate,
+        group_keys,
+        (order_keys, limit, offset),
+    ) = _compile_query(text, properties)
     if star:
-        projection = _star_variables(clauses)
+        names = _star_variables(clauses)
+        projection_items = tuple(("var", name, -1, None) for name in names)
+    else:
+        names = tuple(item[1] for item in projection_items)
 
     matcher = _PathMatcher(model.triples)
     bindings = _eval_clauses(matcher, clauses)
 
-    rows = {tuple(binding.get(name) for name in projection) for binding in bindings}
+    if has_aggregate or group_keys:
+        rows = _aggregate_bindings(bindings, projection_items, group_keys)
+    else:
+        rows = {
+            tuple(binding.get(name) for name in names) for binding in bindings
+        }
     # None（未绑定）排在所有字符串之前，保证混合取值时字典序排序稳定。
     ordered = sorted(rows, key=_projection_sort_key)
     if order_keys:
-        index = {name: i for i, name in enumerate(projection)}
+        index = {name: i for i, name in enumerate(names)}
         # Python 排序稳定：从最后一个排序键开始依次排序，多键按出现顺序
         # 生效，全部键相同的行保持此前的投影字典序。
         for name, descending, _pos in reversed(order_keys):
@@ -1941,7 +2308,63 @@ def run_query(model, text) -> QueryResult:
         ordered = ordered[offset:]
     if limit is not None:
         ordered = ordered[:limit]
-    return QueryResult(projection, tuple(ordered))
+    return QueryResult(names, tuple(ordered))
+
+
+def _aggregate_bindings(bindings, projection_items, group_keys) -> set:
+    """按组键把最终绑定分组并计算聚合，返回投影行的集合。
+
+    组键为 (变量名, 位置) 序列；无组键时全体绑定（含空列表）构成唯一一组，
+    保证无 GROUP BY 的聚合即使无解也输出一行。组键值元组中未绑定变量为
+    None，与其它取值一样区分分组。
+    """
+    group_names = [name for name, _pos in group_keys]
+    if group_names:
+        groups: dict = {}
+        for binding in bindings:  # COUNT 统计组内解：保留重复解，不做预去重
+            key = tuple(binding.get(name) for name in group_names)
+            groups.setdefault(key, []).append(binding)
+        # 有分组而无解时 groups 为空，自然不输出任何行
+        group_iter = groups.items()
+        key_index = {name: i for i, name in enumerate(group_names)}
+    else:
+        group_iter = [(None, bindings)]
+        key_index = {}
+
+    rows = set()
+    for key, group_bindings in group_iter:
+        row = []
+        for kind, name, _pos, agg in projection_items:
+            if kind == "var":
+                row.append(key[key_index[name]])
+            else:
+                row.append(_compute_aggregate(agg, group_bindings))
+        rows.add(tuple(row))
+    return rows
+
+
+def _compute_aggregate(agg: tuple, bindings) -> Any:
+    """在一组绑定上求单个聚合。
+
+    agg 为 (函数名, 是否 DISTINCT, 参数, 参数位置)：参数为 None 表示
+    COUNT(*)，否则为 ("var", 变量名)。COUNT 返回非负整数；MIN/MAX 返回
+    字符串或 None。未绑定变量不计入 COUNT(?v)，MIN/MAX 只比较已绑定的
+    字符串值（Python 字符串序即 Unicode 字典序）。
+    """
+    func, distinct, arg, _arg_pos = agg
+    if func == "COUNT":
+        if arg is None:
+            return len(bindings)
+        var = arg[1]
+        values = [binding[var] for binding in bindings if var in binding]
+        if distinct:
+            return len(set(values))
+        return len(values)
+    var = arg[1]
+    values = [binding[var] for binding in bindings if var in binding]
+    if not values:
+        return None
+    return max(values) if func == "MAX" else min(values)
 
 
 def _projection_sort_key(row) -> tuple:

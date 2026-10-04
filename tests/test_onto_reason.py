@@ -4723,5 +4723,403 @@ class SelectSolutionModifierSyntaxErrorTests(unittest.TestCase):
             self.model.describe("DESCRIBE ?x WHERE { ?x knows ?y } ORDER BY ?x")
 
 
+def aggregate_model():
+    """分组聚合测试模型：含重复取值、未绑定可选项与显式/推理并集。"""
+    rules = [
+        {
+            "id": "knows-likes",
+            "if": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            "then": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+        }
+    ]
+    doc = {
+        "classes": ["Person"],
+        "properties": ["knows", "likes", "score"],
+        "individuals": ["alice", "bob", "carol", "dave"],
+        "triples": [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+            {"subject": "carol", "predicate": "knows", "object": "dave"},
+            {"subject": "alice", "predicate": "score", "object": "b"},
+            {"subject": "alice", "predicate": "score", "object": "a"},
+            {"subject": "bob", "predicate": "score", "object": "c"},
+        ],
+        "rules": rules,
+    }
+    return parse(doc)
+
+
+class GroupAggregateTests(unittest.TestCase):
+    """SELECT 分组聚合：COUNT / MIN / MAX 与 GROUP BY。"""
+
+    def setUp(self):
+        self.model = aggregate_model()
+
+    def test_count_star_overall(self):
+        result = self.model.query(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y }"
+        )
+        self.assertEqual(result.variables, ("?c",))
+        self.assertEqual(result.rows, ((4,),))
+        self.assertIsInstance(result.rows[0][0], int)
+
+    def test_count_star_includes_derived_triples(self):
+        # likes 上 alice->bob、alice->carol、bob->carol、carol->dave
+        # 均由规则 knows-likes 推出
+        result = self.model.query(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x likes ?y }"
+        )
+        self.assertEqual(result.rows, ((4,),))
+
+    def test_count_distinct_variable(self):
+        result = self.model.query(
+            "SELECT (COUNT(?y) AS ?n) (COUNT(DISTINCT ?y) AS ?d) "
+            "WHERE { ?x knows ?y }"
+        )
+        # 4 个解；?y 去重后为 bob/carol/dave 三个值
+        self.assertEqual(result.rows, ((4, 3),))
+
+    def test_group_by_single_key_counts(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP BY ?x"
+        )
+        self.assertEqual(result.variables, ("?x", "?c"))
+        self.assertEqual(
+            result.rows,
+            (("alice", 2), ("bob", 1), ("carol", 1)),
+        )
+
+    def test_group_by_multiple_keys(self):
+        result = self.model.query(
+            "SELECT ?x ?y (COUNT(*) AS ?c) WHERE { ?x knows ?y } "
+            "GROUP BY ?x ?y"
+        )
+        self.assertEqual(
+            result.rows,
+            (
+                ("alice", "bob", 1),
+                ("alice", "carol", 1),
+                ("bob", "carol", 1),
+                ("carol", "dave", 1),
+            ),
+        )
+
+    def test_min_max_unicode_lexicographic(self):
+        result = self.model.query(
+            "SELECT ?x (MIN(?s) AS ?lo) (MAX(?s) AS ?hi) "
+            "WHERE { ?x score ?s } GROUP BY ?x"
+        )
+        self.assertEqual(result.rows, (("alice", "a", "b"), ("bob", "c", "c")))
+
+    def test_min_max_overall(self):
+        result = self.model.query(
+            "SELECT (MIN(?s) AS ?lo) (MAX(?s) AS ?hi) "
+            "WHERE { ?x score ?s }"
+        )
+        self.assertEqual(result.rows, (("a", "c"),))
+
+    def test_count_variable_excludes_unbound(self):
+        # ?y=carol 同时是 alice 与 bob 的认识对象（组内 2 个解）；
+        # dave 作为 ?y 时其后继没有 knows，OPTIONAL 不命中，?z 未绑定
+        result = self.model.query(
+            "SELECT ?y (COUNT(*) AS ?all) (COUNT(?z) AS ?bound) "
+            "WHERE { ?x knows ?y . OPTIONAL { ?y knows ?z } } GROUP BY ?y"
+        )
+        self.assertEqual(
+            result.rows,
+            (
+                ("bob", 1, 1),
+                ("carol", 2, 2),
+                ("dave", 1, 0),
+            ),
+        )
+
+    def test_min_max_none_when_group_has_no_bound_value(self):
+        result = self.model.query(
+            "SELECT ?y (MIN(?z) AS ?lo) (MAX(?z) AS ?hi) "
+            "WHERE { ?x knows ?y . OPTIONAL { ?y score ?z } } GROUP BY ?y"
+        )
+        self.assertEqual(
+            result.rows,
+            (
+                ("bob", "c", "c"),
+                ("carol", None, None),
+                ("dave", None, None),
+            ),
+        )
+
+    def test_no_group_by_single_row_even_without_solutions(self):
+        result = self.model.query(
+            "SELECT (COUNT(*) AS ?a) (COUNT(?x) AS ?b) "
+            "(MIN(?x) AS ?c) (MAX(?x) AS ?d) "
+            "WHERE { ?x knows nobody }"
+        )
+        self.assertEqual(result.rows, ((0, 0, None, None),))
+
+    def test_group_by_no_solutions_emits_no_rows(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x knows nobody } GROUP BY ?x"
+        )
+        self.assertEqual(result.variables, ("?x", "?c"))
+        self.assertEqual(result.rows, ())
+
+    def test_grouping_on_unbound_key_makes_none_group(self):
+        result = self.model.query(
+            "SELECT ?z (COUNT(*) AS ?c) "
+            "WHERE { ?x knows ?y . OPTIONAL { ?y score ?z } } "
+            "GROUP BY ?z ORDER BY ?z"
+        )
+        # ?y=carol（两个 ?x）与 ?y=dave 的 OPTIONAL 均不命中：未绑定组 3 解；
+        # 仅 bob 有 score c。未绑定 ?z 聚成一组（None 升序最先）
+        self.assertEqual(
+            result.rows,
+            ((None, 3), ("c", 1)),
+        )
+
+    def test_rows_sorted_by_projection_then_order_by_alias(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x knows ?y } "
+            "GROUP BY ?x ORDER BY DESC(?c) ?x"
+        )
+        self.assertEqual(
+            result.rows,
+            (("alice", 2), ("bob", 1), ("carol", 1)),
+        )
+
+    def test_order_by_none_aggregate_value_uses_existing_rules(self):
+        asc = self.model.query(
+            "SELECT ?y (MIN(?z) AS ?lo) "
+            "WHERE { ?x knows ?y . OPTIONAL { ?y score ?z } } "
+            "GROUP BY ?y ORDER BY ?lo"
+        )
+        desc = self.model.query(
+            "SELECT ?y (MIN(?z) AS ?lo) "
+            "WHERE { ?x knows ?y . OPTIONAL { ?y score ?z } } "
+            "GROUP BY ?y ORDER BY DESC(?lo)"
+        )
+        self.assertEqual(
+            asc.rows,
+            (("carol", None), ("dave", None), ("bob", "c")),
+        )
+        self.assertEqual(
+            desc.rows,
+            (("bob", "c"), ("carol", None), ("dave", None)),
+        )
+
+    def test_limit_offset_apply_after_aggregation(self):
+        text = "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP BY ?x"
+        self.assertEqual(
+            self.model.query(text + " LIMIT 2").rows,
+            (("alice", 2), ("bob", 1)),
+        )
+        self.assertEqual(
+            self.model.query(text + " OFFSET 2").rows,
+            (("carol", 1),),
+        )
+
+    def test_rows_width_equals_variables_and_immutable(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) (MIN(?s) AS ?lo) "
+            "WHERE { ?x knows ?y . OPTIONAL { ?x score ?s } } GROUP BY ?x"
+        )
+        self.assertEqual(result.variables, ("?x", "?c", "?lo"))
+        self.assertTrue(all(len(r) == 3 for r in result.rows))
+        self.assertIsInstance(result.rows, tuple)
+        self.assertTrue(all(isinstance(r, tuple) for r in result.rows))
+
+    def test_repeated_execution_identical_and_does_not_mutate(self):
+        text = (
+            "SELECT ?x (COUNT(*) AS ?c) (COUNT(DISTINCT ?y) AS ?d) "
+            "WHERE { ?x knows ?y } GROUP BY ?x ORDER BY ?x"
+        )
+        before = (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        )
+        first = self.model.query(text)
+        for _ in range(3):
+            self.assertEqual(self.model.query(text), first)
+        after = (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        )
+        self.assertEqual(before, after)
+
+    def test_no_aggregate_group_by_dedups_projection(self):
+        # 无聚合、仅 GROUP BY：等价于按组键投影去重
+        result = self.model.query(
+            "SELECT ?y WHERE { ?x knows ?y } GROUP BY ?y"
+        )
+        self.assertEqual(result.rows, (("bob",), ("carol",), ("dave",)))
+
+
+class GroupAggregateSyntaxErrorTests(unittest.TestCase):
+    """分组聚合的词法/语法错误。"""
+
+    def setUp(self):
+        self.model = aggregate_model()
+
+    def assertQueryError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(text)
+        message = str(ctx.exception)
+        self.assertTrue(
+            "字符位置" in message or "模式" in message,
+            f"错误消息缺少字符位置或模式序号: {message}",
+        )
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+
+    def test_lowercase_keywords_rejected(self):
+        self.assertQueryError(
+            "SELECT (count(*) AS ?c) WHERE { ?x knows ?y }", "大小写"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(*) as ?c) WHERE { ?x knows ?y }", "大小写"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } group by ?x",
+            "大小写",
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP by ?x",
+            "大小写",
+        )
+        self.assertQueryError(
+            "SELECT (count(DISTINCT ?y) AS ?c) WHERE { ?x knows ?y }", "大小写"
+        )
+
+    def test_star_forbidden_with_aggregation(self):
+        self.assertQueryError(
+            "SELECT * (COUNT(*) AS ?c) WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) * WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT * WHERE { ?x knows ?y } GROUP BY ?x"
+        )
+
+    def test_illegal_aggregate_arguments_and_nesting(self):
+        self.assertQueryError(
+            "SELECT (COUNT(?x ?y) AS ?c) WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT (MIN(*) AS ?c) WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT (MAX(*) AS ?c) WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(DISTINCT *) AS ?c) WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT (MIN(DISTINCT ?x) AS ?c) WHERE { ?x knows ?y }",
+            "DISTINCT",
+        )
+        self.assertQueryError(
+            "SELECT (MAX(DISTINCT ?x) AS ?c) WHERE { ?x knows ?y }",
+            "DISTINCT",
+        )
+        self.assertQueryError(
+            "SELECT (SUM(?x) AS ?c) WHERE { ?x knows ?y }", "COUNT"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(COUNT(?x)) AS ?c) WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT (?x AS ?c) WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT AS ?c) WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(?x) ?c) WHERE { ?x knows ?y }", "AS"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(?x) AS c) WHERE { ?x knows ?y }"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(?x) AS ?c WHERE { ?x knows ?y }"
+        )
+
+    def test_duplicate_or_clashing_alias(self):
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) (COUNT(?x) AS ?c) "
+            "WHERE { ?x knows ?y }",
+            "重复",
+        )
+        self.assertQueryError(
+            "SELECT ?x (COUNT(*) AS ?x) WHERE { ?x knows ?y }",
+            "重复",
+        )
+
+    def test_group_keys_must_be_plain_projected_variables(self):
+        self.assertQueryError(
+            "SELECT (COUNT(?x) AS ?c) WHERE { ?x knows ?y } GROUP BY ?c",
+            "组键",
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP BY ?z",
+            "组键",
+        )
+        self.assertQueryError(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP BY ?x ?x",
+            "组键",
+            "重复",
+        )
+
+    def test_non_group_variable_in_aggregate_projection(self):
+        self.assertQueryError(
+            "SELECT ?x ?y (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP BY ?x",
+            "GROUP BY",
+        )
+
+    def test_order_by_must_reference_projected_name(self):
+        self.assertQueryError(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x knows ?y } "
+            "GROUP BY ?x ORDER BY ?y",
+            "未在投影",
+        )
+
+    def test_group_by_clause_shape_and_position(self):
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP BY"
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP BY ?x ?x",
+            "重复",
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } "
+            "ORDER BY ?c GROUP BY ?x",
+            "GROUP BY",
+        )
+        self.assertQueryError(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } "
+            "GROUP BY ?x GROUP BY ?x",
+            "GROUP BY",
+        )
+
+    def test_limit_offset_still_validated(self):
+        base = "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP BY ?x"
+        self.assertQueryError(base + " LIMIT -1", "非负十进制整数")
+        self.assertQueryError(base + " OFFSET x", "非负十进制整数")
+        self.assertQueryError(base + " LIMIT", "缺少非负整数")
+
+    def test_non_str_and_empty_input(self):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(123)
+        self.assertIn("str", str(ctx.exception))
+        with self.assertRaises(OntologyError):
+            self.model.query("")
+
+
 if __name__ == "__main__":
     unittest.main()
