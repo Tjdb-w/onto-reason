@@ -5162,5 +5162,319 @@ class AggregateQuerySyntaxErrorTests(unittest.TestCase):
         self.assertQueryError("SELECT WHERE { ?x knows ?y }")
 
 
+class HavingQueryTests(unittest.TestCase):
+    """SELECT HAVING：分组聚合后的按组筛选。"""
+
+    def setUp(self):
+        doc = {
+            "classes": ["Person"],
+            "properties": ["knows", "likes"],
+            "individuals": ["alice", "bob", "carol", "dave"],
+            "triples": [
+                {"subject": "alice", "predicate": "knows", "object": "bob"},
+                {"subject": "bob", "predicate": "knows", "object": "carol"},
+                {"subject": "carol", "predicate": "knows", "object": "dave"},
+                {"subject": "alice", "predicate": "likes", "object": "bob"},
+                {"subject": "bob", "predicate": "likes", "object": "carol"},
+                {"subject": "bob", "predicate": "likes", "object": "tennis"},
+                {"subject": "bob", "predicate": "likes", "object": "soccer"},
+                {"subject": "carol", "predicate": "likes", "object": "dave"},
+                {"subject": "carol", "predicate": "likes", "object": "music"},
+            ],
+            "rules": [],
+        }
+        self.model = parse(doc)
+
+    def test_having_filters_groups_by_alias_comparison(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x likes ?y } GROUP BY ?x"
+            " HAVING ?c > 1 ORDER BY ?x"
+        )
+        self.assertEqual(
+            result.variables, ("?x", "?c")
+        )
+        self.assertEqual(result.rows, (("bob", 3), ("carol", 2)))
+
+    def test_having_without_group_by_single_group(self):
+        passed = self.model.query(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } HAVING ?c >= 3"
+        )
+        self.assertEqual(passed.rows, ((3,),))
+        empty = self.model.query(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y } HAVING ?c > 3"
+        )
+        self.assertEqual(empty.variables, ("?c",))
+        self.assertEqual(empty.rows, ())
+
+    def test_having_empty_solution_group_counts_zero(self):
+        result = self.model.query(
+            "SELECT (COUNT(*) AS ?c) WHERE { ?x knows nobody } HAVING ?c = 0"
+        )
+        self.assertEqual(result.rows, ((0,),))
+        result = self.model.query(
+            "SELECT (MIN(?x) AS ?lo) WHERE { ?x knows nobody } HAVING !BOUND(?lo)"
+        )
+        self.assertEqual(result.rows, ((None,),))
+        result = self.model.query(
+            "SELECT (MIN(?x) AS ?lo) WHERE { ?x knows nobody } HAVING BOUND(?lo)"
+        )
+        self.assertEqual(result.rows, ())
+
+    def test_having_with_group_by_no_solutions_is_empty(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x knows nobody } GROUP BY ?x"
+            " HAVING ?c >= 0"
+        )
+        self.assertEqual(result.rows, ())
+
+    def test_inline_aggregates_need_no_alias(self):
+        result = self.model.query(
+            "SELECT ?x WHERE { ?x likes ?y } GROUP BY ?x HAVING COUNT(*) >= 2"
+            " ORDER BY ?x"
+        )
+        self.assertEqual(result.variables, ("?x",))
+        self.assertEqual(result.rows, (("bob",), ("carol",)))
+        result = self.model.query(
+            "SELECT ?x WHERE { ?x likes ?y } GROUP BY ?x "
+            "HAVING COUNT(DISTINCT ?y) = 3"
+        )
+        self.assertEqual(result.rows, (("bob",),))
+        result = self.model.query(
+            "SELECT ?x WHERE { ?x likes ?y } GROUP BY ?x HAVING MIN(?y) = \"carol\""
+        )
+        self.assertEqual(result.rows, (("bob",),))
+        result = self.model.query(
+            "SELECT ?x WHERE { ?x likes ?y } GROUP BY ?x "
+            "HAVING COUNT(?y) = COUNT(*) ORDER BY ?x"
+        )
+        self.assertEqual(result.rows, (("alice",), ("bob",), ("carol",)))
+
+    def test_group_key_operands_and_unicode_ordering(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x likes ?y } GROUP BY ?x"
+            " HAVING ?x < \"c\" ORDER BY ?x"
+        )
+        self.assertEqual(result.rows, (("alice", 1), ("bob", 3)))
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x likes ?y } GROUP BY ?x"
+            " HAVING ?x != \"bob\" ORDER BY ?x"
+        )
+        self.assertEqual(result.rows, (("alice", 1), ("carol", 2)))
+
+    def test_bound_and_not_bound_with_none_values(self):
+        text = (
+            "SELECT ?x (MIN(?z) AS ?lo) WHERE "
+            "{ ?x knows ?y . OPTIONAL { ?y likes ?z } } GROUP BY ?x"
+        )
+        result = self.model.query(text + " HAVING !BOUND(?lo)")
+        self.assertEqual(result.rows, (("carol", None),))
+        result = self.model.query(text + " HAVING BOUND(?lo) ORDER BY ?x")
+        self.assertEqual(result.rows, (("alice", "carol"), ("bob", "dave")))
+
+    def test_and_combines_conditions(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) (MIN(?y) AS ?lo) WHERE { ?x likes ?y }"
+            " GROUP BY ?x HAVING ?c >= 1 AND ?lo = \"bob\""
+        )
+        self.assertEqual(result.rows, (("alice", 1, "bob"),))
+
+    def test_comparison_operators(self):
+        base = "SELECT (COUNT(*) AS ?c) WHERE { ?x likes ?y } HAVING "
+        self.assertEqual(self.model.query(base + "?c <= 6 AND ?c >= 6").rows, ((6,),))
+        self.assertEqual(self.model.query(base + "?c < 7 AND ?c > 5").rows, ((6,),))
+        self.assertEqual(self.model.query(base + "?c != 7").rows, ((6,),))
+        self.assertEqual(self.model.query(base + "?c = 6").rows, ((6,),))
+
+    def test_none_operand_makes_comparison_false(self):
+        text = (
+            "SELECT ?x (MIN(?z) AS ?lo) WHERE "
+            "{ ?x knows ?y . OPTIONAL { ?y likes ?z } } GROUP BY ?x"
+        )
+        bound = (("alice", "carol"), ("bob", "dave"))
+        # 自身相等：已绑定组通过，None 组比较为假被过滤
+        self.assertEqual(
+            self.model.query(text + " HAVING ?lo = ?lo ORDER BY ?x").rows, bound
+        )
+        # 与不存在的字符串不等：已绑定组通过，None 组同样为假
+        self.assertEqual(
+            self.model.query(text + " HAVING ?lo != \"zzz\" ORDER BY ?x").rows,
+            bound,
+        )
+        for op in ("< \"zzz\"", "<= \"z\"", "> \"\"", ">= \"\""):
+            result = self.model.query(text + f" HAVING ?lo {op} ORDER BY ?x")
+            self.assertEqual(
+                result.rows, bound, f"None 组不应通过 ?lo {op}"
+            )
+        # None 与具体值相等/不等均为假
+        self.assertEqual(
+            self.model.query(text + " HAVING ?lo = \"zzz\"").rows, ()
+        )
+
+    def test_mixed_type_comparison_rules(self):
+        base = "SELECT (COUNT(*) AS ?c) WHERE { ?x likes ?y } HAVING "
+        self.assertEqual(self.model.query(base + "?c = \"6\"").rows, ())
+        self.assertEqual(self.model.query(base + "?c != \"6\"").rows, ((6,),))
+        self.assertEqual(self.model.query(base + "?c < \"x\"").rows, ())
+        grouped = (
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x likes ?y } GROUP BY ?x HAVING "
+        )
+        self.assertEqual(
+            self.model.query(grouped + "?x = 0").rows, ()
+        )
+        self.assertEqual(
+            self.model.query(grouped + "?x != 0 ORDER BY ?x").rows,
+            (("alice", 1), ("bob", 3), ("carol", 2)),
+        )
+
+    def test_filtered_groups_skip_order_limit_offset(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x likes ?y } GROUP BY ?x"
+            " HAVING ?c > 1 ORDER BY ?x LIMIT 1 OFFSET 1"
+        )
+        self.assertEqual(result.rows, (("carol", 2),))
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x likes ?y } GROUP BY ?x"
+            " HAVING ?c > 99 ORDER BY ?x"
+        )
+        self.assertEqual(result.variables, ("?x", "?c"))
+        self.assertEqual(len(result), 0)
+
+    def test_aggregate_operand_need_not_appear_in_where(self):
+        result = self.model.query(
+            "SELECT (COUNT(?z) AS ?c) WHERE { ?x knows ?y } HAVING ?c = 0"
+        )
+        self.assertEqual(result.rows, ((0,),))
+        result = self.model.query(
+            "SELECT (COUNT(?z) AS ?c) WHERE { ?x knows ?y } HAVING COUNT(?z) = 0"
+        )
+        self.assertEqual(result.rows, ((0,),))
+
+    def test_repeatable_and_does_not_mutate_model(self):
+        text = (
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x likes ?y } GROUP BY ?x"
+            " HAVING ?c > 1 ORDER BY ?x LIMIT 9 OFFSET 0"
+        )
+        before = (
+            self.model.explicit_triples,
+            self.model.derived_triples,
+            self.model.triples,
+        )
+        first = self.model.query(text)
+        for _ in range(3):
+            self.assertEqual(self.model.query(text), first)
+        self.assertEqual(
+            before,
+            (
+                self.model.explicit_triples,
+                self.model.derived_triples,
+                self.model.triples,
+            ),
+        )
+
+    def test_having_does_not_change_order_by_names(self):
+        result = self.model.query(
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x likes ?y } GROUP BY ?x"
+            " HAVING ?c > 0 ORDER BY DESC(?c)"
+        )
+        self.assertEqual(result.rows, (("bob", 3), ("carol", 2), ("alice", 1)))
+
+
+class HavingSyntaxErrorTests(unittest.TestCase):
+    def setUp(self):
+        doc = {
+            "classes": [],
+            "properties": ["knows"],
+            "individuals": [],
+            "triples": [
+                {"subject": "alice", "predicate": "knows", "object": "bob"},
+            ],
+            "rules": [],
+        }
+        self.model = parse(doc)
+        self.grouped = (
+            "SELECT ?x (COUNT(*) AS ?c) WHERE { ?x knows ?y } GROUP BY ?x"
+        )
+        self.scalar = "SELECT (COUNT(*) AS ?c) WHERE { ?x knows ?y }"
+
+    def assertQueryError(self, text, *fragments):
+        with self.assertRaises(OntologyError) as ctx:
+            self.model.query(text)
+        message = str(ctx.exception)
+        self.assertIn("字符位置", message)
+        for fragment in fragments:
+            self.assertIn(fragment, message)
+
+    def test_position_and_duplication(self):
+        self.assertQueryError(
+            self.grouped + " ORDER BY ?x HAVING ?c > 1", "HAVING", "顺序"
+        )
+        self.assertQueryError(
+            self.scalar + " LIMIT 1 HAVING ?c > 0", "HAVING"
+        )
+        self.assertQueryError(
+            self.scalar + " OFFSET 1 HAVING ?c > 0", "HAVING"
+        )
+        self.assertQueryError(
+            self.grouped + " HAVING ?c > 0 GROUP BY ?x", "重复或顺序"
+        )
+        self.assertQueryError(
+            self.grouped + " HAVING ?c > 1 HAVING ?c > 0", "HAVING", "重复"
+        )
+
+    def test_requires_aggregation_or_group_by(self):
+        self.assertQueryError(
+            "SELECT ?y WHERE { ?x knows ?y } HAVING ?y = \"bob\"", "HAVING"
+        )
+        self.assertQueryError(
+            "SELECT * WHERE { ?x knows ?y } HAVING ?x = \"a\"", "HAVING", "星号"
+        )
+
+    def test_other_query_forms_reject_having(self):
+        with self.assertRaises(OntologyError):
+            self.model.ask("ASK WHERE { ?x knows ?y } HAVING ?c > 0")
+        with self.assertRaises(OntologyError):
+            self.model.construct(
+                "CONSTRUCT { ?x knows ?y } WHERE { ?x knows ?y } HAVING ?c > 0"
+            )
+        with self.assertRaises(OntologyError):
+            self.model.describe(
+                "DESCRIBE ?x WHERE { ?x knows ?y } HAVING ?c > 0"
+            )
+
+    def test_lowercase_keywords_rejected(self):
+        self.assertQueryError(self.grouped + " having ?c > 1", "大小写")
+        self.assertQueryError(self.grouped + " HAVING ?c > 1 and ?c < 9", "大小写")
+        self.assertQueryError(self.grouped + " HAVING bound(?c)", "大小写")
+        self.assertQueryError(self.grouped + " HAVING !bound(?c)", "大小写")
+        self.assertQueryError(self.grouped + " HAVING count(*) > 1", "大小写")
+        self.assertQueryError(
+            self.grouped + " HAVING COUNT(distinct ?y) > 0", "大小写"
+        )
+
+    def test_value_forms(self):
+        self.assertQueryError(self.grouped + " HAVING ?y > 1", "组键")
+        self.assertQueryError(self.grouped + " HAVING ?n = 1", "组键")
+        self.assertQueryError(self.grouped + " HAVING SUM(?y) > 1", "函数")
+        self.assertQueryError(self.grouped + " HAVING abc > 1", "值形式")
+        self.assertQueryError(self.grouped + " HAVING ?c > -1", "值形式")
+        self.assertQueryError(self.grouped + " HAVING ?c > 1.5", "值形式")
+        self.assertQueryError(self.grouped + " HAVING MIN(*) > 1", "MIN")
+        self.assertQueryError(
+            self.grouped + " HAVING COUNT(?y, ?x) > 1", "非法"
+        )
+        self.assertQueryError(
+            self.grouped + " HAVING MIN(DISTINCT ?y) > 1", "DISTINCT"
+        )
+
+    def test_bound_and_condition_shape(self):
+        self.assertQueryError(self.grouped + " HAVING BOUND(\"x\")", "BOUND")
+        self.assertQueryError(self.grouped + " HAVING BOUND(?c", "右圆括号")
+        self.assertQueryError(self.grouped + " HAVING !(?c)", "BOUND")
+        self.assertQueryError(self.grouped + " HAVING ?c >", "右操作数")
+        self.assertQueryError(self.scalar + " HAVING", "条件")
+        self.assertQueryError(self.grouped + " HAVING ?c > 1 AND", "AND")
+        self.assertQueryError(self.grouped + " HAVING ?c ?x", "比较运算符")
+
+
 if __name__ == "__main__":
     unittest.main()

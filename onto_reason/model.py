@@ -396,8 +396,23 @@ class OntologyModel:
         路径中的属性名必须已声明；p?/p* 的零次分支只连接三元组中实际出现
         过的节点，p+ 在环状数据上也会有限结束。OPTIONAL 与 UNION 块内同样
         可以使用属性路径；FILTER 不把路径当作比较操作数。
-        WHERE 右花括号之后还接受可选的解序列修饰符，按 GROUP BY、ORDER
-        BY、LIMIT、OFFSET 的顺序各至多一次：排序键为投影变量或聚合别名
+        WHERE 右花括号之后还接受可选的解序列修饰符，按 GROUP BY、HAVING、
+        ORDER BY、LIMIT、OFFSET 的顺序各至多一次：HAVING 位于 GROUP BY 之后
+        （无 GROUP BY 时直接在花括号之后）、ORDER BY 之前，只能用于带聚合
+        投影或 GROUP BY 的 SELECT，关键字只接受大写；HAVING 后是一个条件，
+        或以大写 AND 连接的多个条件（逻辑与）。条件为 BOUND(值)、!BOUND(值)，
+        或两个操作数用 =、!=、<、<=、>、>= 比较；值可取 GROUP BY 组键变量、
+        投影中的聚合别名、COUNT(*)、COUNT(?v)、COUNT(DISTINCT ?v)、MIN(?v)、
+        MAX(?v) 内联聚合调用（聚合调用不要求输出别名，参数变量不要求出现在
+        WHERE 中），另一操作数还可取字符串常量或非负整数常量；普通变量必须
+        是组键，不得使用 COUNT/MIN/MAX 之外的函数。HAVING 在分组聚合完成后
+        逐组执行、不进入输出投影，也不改变 ORDER BY 可引用的名称；COUNT 产生
+        整数，MIN/MAX 产生字符串或 None，组键未绑定或任一比较值为 None 时
+        比较为假，BOUND(值) 仅在值不是 None 时为真；数字按数值、字符串按
+        Unicode 字典序比较，非 None 混合类型的 '=' 与顺序比较为假、'!=' 为真。
+        被过滤的组不参与去重、排序、OFFSET 与 LIMIT；无 GROUP BY 的空解组也
+        按 COUNT 为 0、MIN/MAX 为 None 计算后再筛选，有 GROUP BY 时无解不产生
+        组；合法查询没有组通过时返回空 QueryResult。排序键为投影变量或聚合别名
         ?v、ASC(?v) 或 DESC(?v)，同一排序变量只能出现一次且必须在投影中；
         LIMIT 与 OFFSET 只接受非负十进制整数，LIMIT 省略时不截断，OFFSET
         默认 0。结果先按投影去重并按字典序排列，有 ORDER BY 时再做稳定
@@ -407,7 +422,8 @@ class OntologyModel:
         查询不修改模型、推理事实或证明，重复执行结果一致。输入不是字符串、
         查询为空、关键字小写、星号用于聚合查询、聚合参数或嵌套形式非法、
         别名重复或与组键/投影冲突、组键未投影或重复、非组键变量混入聚合
-        投影、ORDER BY 引用未投影名称、LIMIT/OFFSET 非法，以及既有词法、
+        投影、HAVING 出现在其他位置或用于非聚合 SELECT、HAVING 条件或值形式
+        非法、ORDER BY 引用未投影名称、LIMIT/OFFSET 非法，以及既有词法、
         语法、未声明属性错误，均抛出 OntologyError；合法查询无匹配不是异常。
         """
         return run_query(self, text)
