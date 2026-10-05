@@ -13,7 +13,9 @@ class InconsistencyError(OntologyError):
 
     冲突包括：同一个体同时属于一对互斥类（disjointClasses），
     同一个体在函数型属性上拥有两个不同取值（functionalProperties），
-    或一条 asymmetricProperties 约束属性上同时存在互相反向的三元组
-    (a, p, b) 与 (b, p, a)（a 等于 b 时 (a, p, a) 单独构成一次自反违反）。
+    一条 asymmetricProperties 约束属性上同时存在互相反向的三元组
+    (a, p, b) 与 (b, p, a)（a 等于 b 时 (a, p, a) 单独构成一次自反违反），
+    一条 inverseFunctionalProperties 约束属性上两个不同主语指向同一宾语，
+    或一条 irreflexiveProperties 约束属性上存在主语等于宾语的三元组。
     抛出本错误时不返回解析模型。
     """

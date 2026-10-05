@@ -11,8 +11,9 @@
   id 为字符串或整数且不得重复；if/then 为三元组模式数组，结构与 triples 相同，
   主语/宾语可以是以 "?" 开头的变量；then 中出现的变量必须在 if 中被绑定。
 - consistency：可选对象，恰含 classMembershipPredicate、disjointClasses、
-  functionalProperties 三个字段，另可含可选的 asymmetricProperties 字段
-  （省略或为空数组表示不检查非对称属性）。
+  functionalProperties 三个字段，另可含可选的 asymmetricProperties、
+  inverseFunctionalProperties、irreflexiveProperties 字段
+  （省略或为空数组表示不做对应检查）。
 
 推理：对规则做前向链推理直至不动点。结论按 (主语, 谓语, 宾语) 字典序输出，
 同一三元组被多条规则推出时保留最先推出它的规则 id；显式三元组优先于推理结论。
@@ -20,8 +21,10 @@
 一致性诊断在结构校验与不动点推理完成后进行：同一个体同时属于一条
 disjointClasses 约束中的两个类、或在一条 functionalProperties 约束的属性上
 有两个不同取值、或在一条 asymmetricProperties 约束的属性上同时存在
-(a, p, b) 与 (b, p, a)（a 等于 b 时 (a, p, a) 单独构成一次自反违反），
-parse 抛出 InconsistencyError 且不返回模型；diagnose 不抛
+(a, p, b) 与 (b, p, a)（a 等于 b 时 (a, p, a) 单独构成一次自反违反）、
+或在一条 inverseFunctionalProperties 约束的属性上两个不同主语指向同一
+宾语、或在一条 irreflexiveProperties 约束的属性上存在主语等于宾语的
+三元组，parse 抛出 InconsistencyError 且不返回模型；diagnose 不抛
 异常，改为返回 ValidationReport（is_consistent 为 False、model 为 None、
 diagnostics 按与异常冲突行相同的顺序列出全部两两冲突）。
 """
@@ -43,17 +46,24 @@ _VARIABLE_PREFIX = "?"
 _CONSISTENCY_REQUIRED_KEYS = frozenset(
     {"classMembershipPredicate", "disjointClasses", "functionalProperties"}
 )
-_CONSISTENCY_OPTIONAL_KEYS = frozenset({"asymmetricProperties"})
+_CONSISTENCY_OPTIONAL_KEYS = frozenset(
+    {"asymmetricProperties", "inverseFunctionalProperties", "irreflexiveProperties"}
+)
 _CONSISTENCY_ALLOWED_KEYS = _CONSISTENCY_REQUIRED_KEYS | _CONSISTENCY_OPTIONAL_KEYS
 _DISJOINT_KEYS = frozenset({"id", "classes"})
 _FUNCTIONAL_KEYS = frozenset({"id", "property"})
 _ASYMMETRIC_KEYS = frozenset({"id", "property"})
+_INVERSE_FUNCTIONAL_KEYS = frozenset({"id", "property"})
+_IRREFLEXIVE_KEYS = frozenset({"id", "property"})
 
 # 冲突诊断的排序分组：互斥类与函数型属性同属现有分组（组内按约束 id
-# 的字符串表示排序，互斥类先于函数型属性），非对称属性为新分组
-# （组内按属性声明顺序排序），整个新分组排在现成分组之后。
+# 的字符串表示排序，互斥类先于函数型属性），非对称属性、逆函数型属性与
+# 禁自反属性依次为后续新分组（组内按属性声明顺序排序），全部新分组排在
+# 现成分组之后。
 _CONFLICT_GROUP_EXISTING = 0
 _CONFLICT_GROUP_ASYMMETRIC = 1
+_CONFLICT_GROUP_INVERSE_FUNCTIONAL = 2
+_CONFLICT_GROUP_IRREFLEXIVE = 3
 _CONFLICT_DISJOINT = 0
 _CONFLICT_FUNCTIONAL = 1
 
@@ -106,14 +116,47 @@ class _AsymmetricConstraint:
         self.property = property_
 
 
-class _Consistency:
-    __slots__ = ("membership_predicate", "disjoint", "functional", "asymmetric")
+class _InverseFunctionalConstraint:
+    __slots__ = ("constraint_id", "property")
 
-    def __init__(self, membership_predicate, disjoint, functional, asymmetric) -> None:
+    def __init__(self, constraint_id, property_: str) -> None:
+        self.constraint_id = constraint_id
+        self.property = property_
+
+
+class _IrreflexiveConstraint:
+    __slots__ = ("constraint_id", "property")
+
+    def __init__(self, constraint_id, property_: str) -> None:
+        self.constraint_id = constraint_id
+        self.property = property_
+
+
+class _Consistency:
+    __slots__ = (
+        "membership_predicate",
+        "disjoint",
+        "functional",
+        "asymmetric",
+        "inverse_functional",
+        "irreflexive",
+    )
+
+    def __init__(
+        self,
+        membership_predicate,
+        disjoint,
+        functional,
+        asymmetric,
+        inverse_functional,
+        irreflexive,
+    ) -> None:
         self.membership_predicate = membership_predicate
         self.disjoint = disjoint
         self.functional = functional
         self.asymmetric = asymmetric
+        self.inverse_functional = inverse_functional
+        self.irreflexive = irreflexive
 
 
 class OntologyEngine:
@@ -404,7 +447,25 @@ class OntologyEngine:
         asymmetric = self._parse_asymmetric(
             root.get("asymmetricProperties", []), properties, seen_ids
         )
-        return _Consistency(predicate, disjoint, functional, asymmetric)
+        inverse_functional = self._parse_property_constraints(
+            root.get("inverseFunctionalProperties", []),
+            properties,
+            seen_ids,
+            "inverseFunctionalProperties",
+            _INVERSE_FUNCTIONAL_KEYS,
+            _InverseFunctionalConstraint,
+        )
+        irreflexive = self._parse_property_constraints(
+            root.get("irreflexiveProperties", []),
+            properties,
+            seen_ids,
+            "irreflexiveProperties",
+            _IRREFLEXIVE_KEYS,
+            _IrreflexiveConstraint,
+        )
+        return _Consistency(
+            predicate, disjoint, functional, asymmetric, inverse_functional, irreflexive
+        )
 
     def _claim_constraint_id(self, constraint_id, where: str, seen_ids: dict) -> None:
         if not _is_id(constraint_id):
@@ -550,6 +611,47 @@ class OntologyEngine:
             result.append(_AsymmetricConstraint(item["id"], property_))
         return result
 
+    def _parse_property_constraints(
+        self, items, properties: frozenset, seen_ids: dict, field: str, keys, factory
+    ):
+        """解析 {"id", "property"} 形式的属性约束数组（逆函数型/禁自反共用）。"""
+        if not isinstance(items, list):
+            raise OntologyError(
+                f"consistency[{field!r}] 必须是对象数组，"
+                f"收到 {type(items).__name__}"
+            )
+        result = []
+        for index, item in enumerate(items):
+            where = f"consistency[{field!r}][{index}]"
+            if not isinstance(item, dict):
+                raise OntologyError(
+                    f"{where} 必须是包含 id/property 的对象，收到 {item!r}"
+                )
+            item_keys = set(item)
+            if item_keys != keys:
+                missing = keys - item_keys
+                extra = item_keys - keys
+                detail = []
+                if missing:
+                    detail.append("缺少 " + ", ".join(sorted(missing)))
+                if extra:
+                    detail.append("多出 " + ", ".join(sorted(extra)))
+                raise OntologyError(f"{where} 结构不合法（{'; '.join(detail)}）")
+
+            self._claim_constraint_id(item["id"], where, seen_ids)
+
+            property_ = item["property"]
+            if not isinstance(property_, str) or not property_:
+                raise OntologyError(
+                    f"{where}['property'] 必须是非空字符串，收到 {property_!r}"
+                )
+            if property_ not in properties:
+                raise OntologyError(
+                    f"{where}['property'] 引用了未声明的属性 {property_!r}"
+                )
+            result.append(factory(item["id"], property_))
+        return result
+
     # ---------- 前向链推理 ----------
 
     def _forward_chain(self, explicit: List[Triple], rules: List[_RulePattern]) -> Dict[Triple, object]:
@@ -621,7 +723,9 @@ class OntologyEngine:
         每项为 (排序键, 诊断字典, (证据三元组1, 证据三元组2))；证据三元组
         与诊断 evidence 两项一一对应：互斥类为 (个体, 成员谓语, 类名)，
         函数型属性为 (个体, 约束属性, 取值)，非对称属性为
-        (字典序较小节点, 约束属性, 字典序较大节点)；自反时两项为同一三元组。
+        (字典序较小节点, 约束属性, 字典序较大节点)，逆函数型属性为
+        (字典序较小主语, 约束属性, 共享宾语) 与 (字典序较大主语, 约束属性,
+        共享宾语)，禁自反属性为 (个体, 约束属性, 个体)；自反时两项为同一三元组。
         """
         # 全部事实的来源表：显式事实为 None，推理结论为来源规则 id。
         fact_source: Dict[Triple, Optional[object]] = {t: None for t in explicit}
@@ -643,6 +747,16 @@ class OntologyEngine:
         conflicts.extend(
             self._asymmetric_conflicts(
                 fact_source, consistency.asymmetric, property_order
+            )
+        )
+        conflicts.extend(
+            self._inverse_functional_conflicts(
+                fact_source, consistency.inverse_functional, property_order
+            )
+        )
+        conflicts.extend(
+            self._irreflexive_conflicts(
+                fact_source, consistency.irreflexive, property_order
             )
         )
         if not conflicts:
@@ -895,6 +1009,143 @@ class OntologyEngine:
             Triple(second, property_, first),
         )
         conflicts.append((key, diagnostic, pair))
+
+    def _inverse_functional_conflicts(
+        self,
+        fact_source: Dict[Triple, Optional[object]],
+        constraints,
+        property_order: Tuple[str, ...],
+    ):
+        """收集逆函数型属性违反：同一属性上两个不同主语指向同一宾语。
+
+        无序主语对只报一次，按共享宾语分组后取主语字典序的两两组合。
+        """
+        property_rank = {name: pos for pos, name in enumerate(property_order)}
+        conflicts = []
+        for constraint in constraints:
+            property_ = constraint.property
+            # object -> {subject: 来源}
+            by_object: Dict[str, Dict[str, Optional[object]]] = {}
+            for triple, source in fact_source.items():
+                if triple.predicate != property_:
+                    continue
+                by_object.setdefault(triple.object, {}).setdefault(
+                    triple.subject, source
+                )
+            for object_, subjects in by_object.items():
+                if len(subjects) < 2:
+                    continue
+                ordered = sorted(subjects)
+                for pos, first in enumerate(ordered):
+                    for second in ordered[pos + 1 :]:
+                        src1 = subjects[first]
+                        src2 = subjects[second]
+                        message = (
+                            f"[inverseFunctionalProperties id={constraint.constraint_id!r}] "
+                            f"逆函数型属性 {property_!r} 上两个不同个体 {first!r} 与 "
+                            f"{second!r} 指向同一宾语 {object_!r}："
+                            f"{first!r} 为{self._describe_source(src1)}；"
+                            f"{second!r} 为{self._describe_source(src2)}"
+                        )
+                        diagnostic = {
+                            "kind": "inverseFunctionalPropertyValue",
+                            "constraintId": constraint.constraint_id,
+                            "subject": first,
+                            "evidence": (
+                                {
+                                    "object": object_,
+                                    "source": self._source_info(src1),
+                                },
+                                {
+                                    "object": object_,
+                                    "source": self._source_info(src2),
+                                },
+                            ),
+                            "message": message,
+                        }
+                        key = (
+                            _CONFLICT_GROUP_INVERSE_FUNCTIONAL,
+                            property_rank.get(property_, len(property_rank)),
+                            first,
+                            second,
+                            object_,
+                            str(constraint.constraint_id),
+                            self._source_pair_key(src1, src2),
+                        )
+                        pair = (
+                            Triple(first, property_, object_),
+                            Triple(second, property_, object_),
+                        )
+                        conflicts.append((key, diagnostic, pair))
+        return conflicts
+
+    def _irreflexive_conflicts(
+        self,
+        fact_source: Dict[Triple, Optional[object]],
+        constraints,
+        property_order: Tuple[str, ...],
+    ):
+        """收集禁自反属性违反：主体等于宾语的三元组，每个体只报一次。"""
+        property_rank = {name: pos for pos, name in enumerate(property_order)}
+        conflicts = []
+        for constraint in constraints:
+            property_ = constraint.property
+            # subject -> 来源（仅自反三元组）
+            reflexive: Dict[str, Optional[object]] = {}
+            for triple, source in fact_source.items():
+                if triple.predicate != property_:
+                    continue
+                if triple.subject != triple.object:
+                    continue
+                reflexive.setdefault(triple.subject, source)
+            for subject in sorted(reflexive):
+                source = reflexive[subject]
+                message = (
+                    f"[irreflexiveProperties id={constraint.constraint_id!r}] "
+                    f"禁自反属性 {property_!r} 上个体 {subject!r} 存在自反三元组"
+                    f"（主语与宾语相同）：{subject!r} 为{self._describe_source(source)}"
+                )
+                diagnostic = {
+                    "kind": "irreflexivePropertySelf",
+                    "constraintId": constraint.constraint_id,
+                    "subject": subject,
+                    "evidence": (
+                        {
+                            "subject": subject,
+                            "object": subject,
+                            "source": self._source_info(source),
+                        },
+                        {
+                            "subject": subject,
+                            "object": subject,
+                            "source": self._source_info(source),
+                        },
+                    ),
+                    "message": message,
+                }
+                key = (
+                    _CONFLICT_GROUP_IRREFLEXIVE,
+                    property_rank.get(property_, len(property_rank)),
+                    subject,
+                    str(constraint.constraint_id),
+                    self._source_pair_key(source, source),
+                )
+                pair = (
+                    Triple(subject, property_, subject),
+                    Triple(subject, property_, subject),
+                )
+                conflicts.append((key, diagnostic, pair))
+        return conflicts
+
+    @staticmethod
+    def _source_pair_key(src1, src2):
+        """来源仅作为极端并列时的稳定次序：显式(0) 先于推理(1)，推理按 ruleId 字符串。"""
+        return (
+            0 if src1 is None else 1,
+            "" if src1 is None else str(src1),
+            0 if src2 is None else 1,
+            "" if src2 is None else str(src2),
+        )
 
     @staticmethod
     def _source_info(source) -> dict:

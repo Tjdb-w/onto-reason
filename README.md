@@ -116,10 +116,12 @@ DESCRIBE (?变量 ... | *) WHERE { 模式 ('.' 模式)* '.'? }
 ## 一致性诊断
 
 `OntologyEngine.parse` 在结构校验与不动点推理完成后检查 `consistency` 约束，
-发现互斥类成员、函数型属性多值或非对称属性反向三元组冲突时抛出
+发现互斥类成员、函数型属性多值、非对称属性反向三元组、逆函数型属性
+共享宾语或禁自反属性自反三元组冲突时抛出
 `InconsistencyError`，不返回模型。`consistency` 除原有
 `classMembershipPredicate`、`disjointClasses`、`functionalProperties` 字段外，
-另含可选字段 `asymmetricProperties`：省略或为空数组表示不检查非对称属性；
+另含可选字段 `asymmetricProperties`、`inverseFunctionalProperties` 与
+`irreflexiveProperties`：省略或为空数组表示不做对应检查；
 每项为 `{"id": ..., "property": ...}`，`id` 为非空字符串或整数（`bool` 不算）
 且同一 `consistency` 内各约束数组间不重复，`property` 必须是已声明属性。
 未知字段、类型错误、重复 `id` 或未声明属性均为结构错误，`parse` 与
@@ -138,8 +140,9 @@ DESCRIBE (?变量 ... | *) WHERE { 模式 ('.' 模式)* '.'? }
 每条诊断是字段固定为 `kind`、`constraintId`、`subject`、`evidence`、`message`
 的字典：
 
-- `kind` 为 `"disjointClassMembership"`、`"functionalPropertyValue"` 或
-  `"asymmetricPropertyPair"`；前两者的 `evidence` 各恰含两项：互斥类为
+- `kind` 为 `"disjointClassMembership"`、`"functionalPropertyValue"`、
+  `"asymmetricPropertyPair"`、`"inverseFunctionalPropertyValue"` 或
+  `"irreflexivePropertySelf"`；前两者的 `evidence` 各恰含两项：互斥类为
   `class` 与 `source` 且类名按字典序排列，函数型属性为 `object` 与 `source`
   且取值按字典序排列。非对称属性的 `evidence` 恰含两项，每项固定为
   `subject`、`object`、`source`：在显式与推理三元组并集上，约束属性 `p`
@@ -147,7 +150,13 @@ DESCRIBE (?变量 ... | *) WHERE { 模式 ('.' 模式)* '.'? }
   `{a, b}` 的字典序排列（第一项 subject 较小）；`a` 等于 `b` 时 `(a, p, a)`
   单独构成一次自反违反，两项指向同一事实。诊断按无序节点对去重，整体排在
   互斥类与函数型属性冲突之后，新约束内按属性声明顺序、节点字典序与来源
-  稳定排序。
+  稳定排序。逆函数型属性的 `evidence` 恰含两项，每项固定为 `object` 与
+  `source`：约束属性 `p` 上两个不同主语指向同一宾语 `o` 时违反一次，
+  两项按无序主语对的字典序排列（第一项对应较小主语），无序主语对只报
+  一次。禁自反属性的 `evidence` 恰含两项，每项固定为 `subject`、`object`
+  与 `source` 且两项指向同一事实：约束属性 `p` 上存在 `(a, p, a)` 时违反
+  一次。两类新诊断依次排在非对称属性分组之后，约束内同样按属性声明
+  顺序、节点字典序与来源稳定排序。
 - `constraintId` 保留原始字符串或整数。
 - `source` 为 `{"kind": "explicit"}`（显式事实）或
   `{"kind": "derived", "ruleId": ...}`（推理事实，`ruleId` 为原始规则 id）。
@@ -167,6 +176,11 @@ DESCRIBE (?变量 ... | *) WHERE { 模式 ('.' 模式)* '.'? }
 - `asymmetricPropertyPair`：两项与 `evidence` 顺序一致，分别证明
   `(first, property, second)` 与 `(second, property, first)` 两条反向事实；
   自反违反时两项都证明同一事实 `(subject, property, subject)`。
+- `inverseFunctionalPropertyValue`：两项与 `evidence` 顺序一致，分别证明
+  `(first, property, object)` 与 `(second, property, object)` 两条共享宾语
+  的事实，first/second 为无序主语对按字典序排列后的两端；
+- `irreflexivePropertySelf`：两项都证明同一自反事实
+  `(subject, property, subject)`。
 
 每项是一个 `Proof` 元组：
 
