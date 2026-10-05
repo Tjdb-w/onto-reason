@@ -396,8 +396,12 @@ class OntologyModel:
         路径中的属性名必须已声明；p?/p* 的零次分支只连接三元组中实际出现
         过的节点，p+ 在环状数据上也会有限结束。OPTIONAL 与 UNION 块内同样
         可以使用属性路径；FILTER 不把路径当作比较操作数。
-        WHERE 右花括号之后还接受可选的解序列修饰符，按 GROUP BY、ORDER
-        BY、LIMIT、OFFSET 的顺序各至多一次：排序键为投影变量或聚合别名
+        WHERE 右花括号之后还接受可选的解序列修饰符，按 GROUP BY、HAVING、
+        ORDER BY、LIMIT、OFFSET 的顺序各至多一次：HAVING 对分组聚合结果
+        逐组筛选（BOUND(值)/!BOUND(值) 或值与值、字符串常量、非负整数常量
+        的 =/!=/</<=/>/>= 比较，多个条件用大写 AND 连接；值可取组键变量、
+        聚合别名或匿名聚合调用，任一比较值为 None 时比较为假），被过滤的
+        组不参与去重、排序、OFFSET 与 LIMIT；排序键为投影变量或聚合别名
         ?v、ASC(?v) 或 DESC(?v)，同一排序变量只能出现一次且必须在投影中；
         LIMIT 与 OFFSET 只接受非负十进制整数，LIMIT 省略时不截断，OFFSET
         默认 0。结果先按投影去重并按字典序排列，有 ORDER BY 时再做稳定
@@ -407,7 +411,8 @@ class OntologyModel:
         查询不修改模型、推理事实或证明，重复执行结果一致。输入不是字符串、
         查询为空、关键字小写、星号用于聚合查询、聚合参数或嵌套形式非法、
         别名重复或与组键/投影冲突、组键未投影或重复、非组键变量混入聚合
-        投影、ORDER BY 引用未投影名称、LIMIT/OFFSET 非法，以及既有词法、
+        投影、HAVING 用于无聚合投影且无 GROUP BY 的查询或其变量不是组键/
+        聚合别名、ORDER BY 引用未投影名称、LIMIT/OFFSET 非法，以及既有词法、
         语法、未声明属性错误，均抛出 OntologyError；合法查询无匹配不是异常。
         """
         return run_query(self, text)

@@ -68,9 +68,30 @@
   MIN(?v)/MAX(?v) 在组内已绑定的字符串值上按 Unicode 字典序取最小/
   最大值，没有已绑定值时为 None。聚合参数变量不要求出现在模式中。
 - SELECT 在 WHERE 模式体右花括号之后还接受可选的解序列修饰符，按
-  GROUP BY、ORDER BY、LIMIT、OFFSET 的顺序出现，各自至多一次：
+  GROUP BY、HAVING、ORDER BY、LIMIT、OFFSET 的顺序出现，各自至多一次：
     SELECT 投影 WHERE { 模式体 }
-      (GROUP BY 分组变量+)? (ORDER BY 排序键+)? (LIMIT n)? (OFFSET m)?
+      (GROUP BY 分组变量+)? (HAVING 条件)? (ORDER BY 排序键+)?
+      (LIMIT n)? (OFFSET m)?
+- GROUP BY 之后、ORDER BY 之前可出现至多一个 HAVING 子句，对分组聚合
+  结果逐组筛选；HAVING 不得出现在其他位置，关键字只接受大写，重复、
+  倒置，或在既无聚合投影又无 GROUP BY 的 SELECT 中使用，均抛
+  OntologyError。HAVING 后是一个条件，或用大写 AND 连接的多个条件
+  （按逻辑与筛选）：
+    条件 := BOUND(值) | !BOUND(值) | 值 比较运算符 操作数
+    值 := 组键变量 | 聚合别名 | 匿名聚合调用
+    比较运算符 := = | != | < | <= | > | >=
+  匿名聚合调用为 COUNT(*)、COUNT(?v)、COUNT(DISTINCT ?v)、MIN(?v)、
+  MAX(?v)，不要求输出别名，不得使用其他函数，聚合参数变量不要求出现
+  在 WHERE 中；比较的右操作数还可取同样的值形式、字符串常量或非负
+  整数常量。普通变量必须是组键或投影中的聚合别名。COUNT 产生整数，
+  MIN/MAX 产生字符串或 None；组键未绑定或任一比较值为 None 时比较
+  为假，BOUND(值) 仅在值不是 None 时为真。数字按数值比较，字符串按
+  Unicode 字典序比较，非 None 混合类型的 = 与顺序比较为假、!= 为真。
+  HAVING 在分组聚合完成后逐组执行，不进入输出投影，也不改变 ORDER BY
+  可引用的名称；被过滤的组不参与去重、排序、OFFSET 与 LIMIT。无
+  GROUP BY 的聚合查询仍只有一个组，空解组也按 COUNT 为 0、MIN/MAX 为
+  None 计算后再筛选；有 GROUP BY 时无解不产生组。合法查询没有组通过
+  时返回空 QueryResult，而不是异常。
   排序键为投影变量 ?v、ASC(?v)（升序，与裸变量相同）或 DESC(?v)（降序）；
   同一排序变量只能出现一次，且必须出现在投影中（聚合查询下可以是组键
   普通变量或聚合别名；'*' 投影下为任一模式变量）。
@@ -122,6 +143,10 @@ _TOK_STAR = "STAR"
 _TOK_BANG = "BANG"
 _TOK_EQ = "EQ"
 _TOK_NE = "NE"
+_TOK_LT = "LT"
+_TOK_LE = "LE"
+_TOK_GT = "GT"
+_TOK_GE = "GE"
 _TOK_HAT = "HAT"
 _TOK_SLASH = "SLASH"
 _TOK_PIPE = "PIPE"
@@ -154,7 +179,7 @@ _EXPR_EQ = "EQ"
 _EXPR_NE = "NE"
 
 # SELECT 解序列修饰符关键字（按允许出现的顺序；GROUP BY 只用于结构检查）
-_MODIFIER_WORDS = ("GROUP", "ORDER", "LIMIT", "OFFSET")
+_MODIFIER_WORDS = ("GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET")
 # GROUP BY / ORDER BY 结构内的关键字（用于大小写校验）
 _ORDER_WORDS = ("BY", "ASC", "DESC")
 # 聚合投影支持的函数名（大写）；SELECT 头部的其余大写单词按未知成分报错
@@ -464,30 +489,39 @@ class _Lexer:
         return _Token(_TOK_NAME, text[start:j], start)
 
     def _next_string(self, i: int, text: str, n: int) -> _Token:
-        start = i
-        j = i + 1
-        while j < n:
-            if text[j] == "\\":
-                j += 2
-                continue
-            if text[j] == '"':
-                break
-            j += 1
-        if j >= n:
-            raise OntologyError(f"词法错误：字符串未闭合（字符位置 {start}）")
-        raw = text[start : j + 1]
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise OntologyError(
-                f"词法错误：非法的 JSON 字符串（字符位置 {start}）：{exc.msg}"
-            ) from exc
-        if not isinstance(value, str):  # pragma: no cover - 双引号内容必为 JSON 字符串
-            raise OntologyError(
-                f"词法错误：字符串常量必须解码为字符串（字符位置 {start}）"
-            )
-        self.pos = j + 1
-        return _Token(_TOK_STRING, value, start)
+        tok, end = _scan_string_token(text, i)
+        self.pos = end
+        return tok
+
+
+def _scan_string_token(text: str, start: int):
+    """start 指向起始双引号，返回 (STRING token, 下一个字符位置)。
+
+    与主词法的字符串规则完全一致：JSON 解码，未闭合或非法时抛词法错误。
+    """
+    n = len(text)
+    j = start + 1
+    while j < n:
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == '"':
+            break
+        j += 1
+    if j >= n:
+        raise OntologyError(f"词法错误：字符串未闭合（字符位置 {start}）")
+    raw = text[start : j + 1]
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise OntologyError(
+            f"词法错误：非法的 JSON 字符串（字符位置 {start}）：{exc.msg}"
+        ) from exc
+    if not isinstance(value, str):  # pragma: no cover - 双引号内容必为 JSON 字符串
+        raise OntologyError(
+            f"词法错误：字符串常量必须解码为字符串（字符位置 {start}）"
+        )
+    return _Token(_TOK_STRING, value, start), j + 1
 
 
 class _Path:
@@ -524,6 +558,8 @@ def _tail_tokens(text: str, start: int) -> List[_Token]:
     非圆括号、非 '?' 的字符为一个单词（整数、关键字或未知成分都由解析器
     进一步甄别）。该区域不允许字符串常量，出现 '"' 时按普通单词字符处理，
     最终会在解析器处报未知语句成分。
+    遇到大写单词 HAVING 时停止本词法，其后文本改由 _having_tokens 扫描
+    （HAVING 条件区需要字符串常量、比较运算符与 COUNT(*) 的 '*'）。
     """
     tokens: List[_Token] = []
     n = len(text)
@@ -555,6 +591,90 @@ def _tail_tokens(text: str, start: int) -> List[_Token]:
             continue
         j = i
         while j < n and not text[j].isspace() and text[j] not in "()?":
+            j += 1
+        tokens.append(_Token(_TOK_NAME, text[i:j], i))
+        if text[i:j] == "HAVING":
+            tokens.extend(_having_tokens(text, j))
+            break
+        i = j
+    return tokens
+
+
+def _having_tokens(text: str, start: int) -> List[_Token]:
+    """对 HAVING 关键字之后的条件与后续修饰符区域做词法扫描。
+
+    与尾部修饰符词法的差异：'"' 起 JSON 字符串常量，'*' 是独立 token
+    （COUNT(*) 的参数），'='、'!='、'<'、'<='、'>'、'>=' 是比较运算符，
+    '!' 是 BOUND 的否定前缀；'('、')' 与 '?' 起变量的规则不变。该区域
+    产出的 token 是 ORDER BY、LIMIT、OFFSET 所需词法的超集，因此 HAVING
+    条件结束后可以用同一 token 序列继续解析既有修饰符。
+    """
+    tokens: List[_Token] = []
+    n = len(text)
+    i = start
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "?":
+            j = i + 1
+            while j < n and _is_var_char(text[j]):
+                j += 1
+            if j == i + 1:
+                raise OntologyError(
+                    f"词法错误：'?' 后必须至少跟随一个字母、数字或下划线"
+                    f"（字符位置 {i}）"
+                )
+            tokens.append(_Token(_TOK_VAR, text[i:j], i))
+            i = j
+            continue
+        if ch == "(":
+            tokens.append(_Token(_TOK_LPAREN, ch, i))
+            i += 1
+            continue
+        if ch == ")":
+            tokens.append(_Token(_TOK_RPAREN, ch, i))
+            i += 1
+            continue
+        if ch == "*":
+            tokens.append(_Token(_TOK_STAR, ch, i))
+            i += 1
+            continue
+        if ch == "!":
+            if i + 1 < n and text[i + 1] == "=":
+                tokens.append(_Token(_TOK_NE, "!=", i))
+                i += 2
+            else:
+                tokens.append(_Token(_TOK_BANG, "!", i))
+                i += 1
+            continue
+        if ch == "=":
+            tokens.append(_Token(_TOK_EQ, "=", i))
+            i += 1
+            continue
+        if ch == "<":
+            if i + 1 < n and text[i + 1] == "=":
+                tokens.append(_Token(_TOK_LE, "<=", i))
+                i += 2
+            else:
+                tokens.append(_Token(_TOK_LT, "<", i))
+                i += 1
+            continue
+        if ch == ">":
+            if i + 1 < n and text[i + 1] == "=":
+                tokens.append(_Token(_TOK_GE, ">=", i))
+                i += 2
+            else:
+                tokens.append(_Token(_TOK_GT, ">", i))
+                i += 1
+            continue
+        if ch == '"':
+            tok, i = _scan_string_token(text, i)
+            tokens.append(tok)
+            continue
+        j = i
+        while j < n and not text[j].isspace() and text[j] not in '()*?!<>="':
             j += 1
         tokens.append(_Token(_TOK_NAME, text[i:j], i))
         i = j
@@ -1001,8 +1121,9 @@ class _Parser:
 
         投影项为 ("v", 变量名, 位置) 或
         ("a", 别名, 聚合种类, 参数变量或 None, 位置)；星号投影时为空列表。
-        解序列修饰符为 (分组键, 排序键, LIMIT 或 None, OFFSET)，分组键与
-        排序键均为 (变量名, 字符位置) / (变量名, 是否降序, 字符位置) 元组。
+        解序列修饰符为 (分组键, HAVING 子句, 排序键, LIMIT 或 None, OFFSET)，
+        分组键与排序键均为 (变量名, 字符位置) / (变量名, 是否降序, 字符位置)
+        元组，HAVING 子句为 None 或 (关键字字符位置, 条件元组)。
         """
         # SELECT 关键字与整个投影区都由独立的头部扫描器切分：普通词法下
         # '(' 等字符可能是名称的一部分，头部扫描可以在不改动历史词法的
@@ -1022,8 +1143,9 @@ class _Parser:
         clauses = self._parse_group_body(optional=False)
         # _parse_group_body 已消费右花括号；右花括号之后只允许解序列修饰符
         modifiers = self._parse_solution_modifiers(star)
-        group_keys, order_keys, _limit, _offset = modifiers
+        group_keys, having, order_keys, _limit, _offset = modifiers
         self._validate_select_head(head, star, group_keys, clauses)
+        self._validate_having(head, star, group_keys, having)
         self._validate_order_keys(head, star, order_keys, clauses, group_keys)
         return head, clauses, star, modifiers
 
@@ -1898,30 +2020,67 @@ class _Parser:
                     f"排序变量 {name} 未在投影中出现（字符位置 {pos}）"
                 )
 
+    def _validate_having(self, head, star: bool, group_keys, having) -> None:
+        """HAVING 子句的语义约束。
+
+        HAVING 只能用于带聚合投影或 GROUP BY 的 SELECT；条件中的普通变量
+        必须是 GROUP BY 组键或投影中的聚合别名（别名不得与组键、普通投影
+        变量或其他别名重名由投影校验保证，因此两者不会混淆）。聚合参数
+        变量不要求出现在模式中。
+        """
+        if having is None:
+            return
+        kw_pos, conditions = having
+        aggs = [] if star else [item for item in head if item[0] == "a"]
+        if not aggs and not group_keys:
+            raise OntologyError(
+                "HAVING 只能用于带聚合投影或 GROUP BY 的 SELECT 查询"
+                f"（字符位置 {kw_pos}）"
+            )
+        key_names = {name for name, _pos in group_keys}
+        alias_names = {item[1] for item in aggs}
+        for cond in conditions:
+            if cond[0] == "cmp":
+                values = (cond[2], cond[3])
+            else:
+                values = (cond[1],)
+            for value in values:
+                if value[0] != "var":
+                    continue
+                name = value[1]
+                if name not in key_names and name not in alias_names:
+                    raise OntologyError(
+                        f"HAVING 条件中的变量 {name} 既不是 GROUP BY 组键也不是"
+                        f"聚合别名（字符位置 {value[2]}）"
+                    )
+
     # ---------- SELECT 解序列修饰符（WHERE 右花括号之后） ----------
     #
-    # 修饰符只作用于 SELECT：ORDER BY 排序键+、LIMIT 非负整数、OFFSET 非负整数，
-    # 按此顺序各自至多出现一次。右花括号之后的文本由独立的尾部词法扫描
-    # （'('、')' 是独立 token，'?' 起变量，其余连续非空白字符为单词），
-    # 不影响主词法对模式体的既有切分。
+    # 修饰符只作用于 SELECT：GROUP BY 分组键+、HAVING 条件、ORDER BY 排序键+、
+    # LIMIT 非负整数、OFFSET 非负整数，按此顺序各自至多出现一次。右花括号之后
+    # 的文本由独立的尾部词法扫描（'('、')' 是独立 token，'?' 起变量，其余连续
+    # 非空白字符为单词），不影响主词法对模式体的既有切分；遇到 HAVING 关键字
+    # 后改用 HAVING 词法（字符串常量、比较运算符、'*'）。
 
     def _parse_solution_modifiers(self, star: bool) -> tuple:
         """解析 WHERE 右花括号之后的修饰符序列。
 
-        返回 (分组键, 排序键, LIMIT, OFFSET)：分组键为
-        (变量名, 字符位置) 元组，排序键为 (变量名, 是否降序, 字符位置) 元组，
-        LIMIT 缺省为 None（不截断），OFFSET 缺省为 0。self._last 此时是
-        模式体的右花括号。修饰符按 GROUP BY、ORDER BY、LIMIT、OFFSET 的
+        返回 (分组键, HAVING 子句, 排序键, LIMIT, OFFSET)：分组键为
+        (变量名, 字符位置) 元组，HAVING 子句为 None 或 (关键字字符位置,
+        条件元组)，排序键为 (变量名, 是否降序, 字符位置) 元组，LIMIT 缺省
+        为 None（不截断），OFFSET 缺省为 0。self._last 此时是模式体的右
+        花括号。修饰符按 GROUP BY、HAVING、ORDER BY、LIMIT、OFFSET 的
         顺序各至多出现一次。
         """
         tokens = _tail_tokens(self._text, self._last.pos + 1)
         group_keys: List[tuple] = []
+        having = None
         order_keys: List[tuple] = []
         limit = None
         offset = 0
         group_pos = None
-        # stage：0 可出现 GROUP/ORDER，1 可出现 ORDER/LIMIT，2 可出现
-        # LIMIT/OFFSET，3 只能出现 OFFSET，4 全部结束
+        # stage：0 可出现 GROUP/HAVING，1 可出现 HAVING/ORDER，2 可出现
+        # ORDER/LIMIT，3 可出现 LIMIT/OFFSET，4 只能出现 OFFSET，5 全部结束
         stage = 0
         i = 0
         while i < len(tokens):
@@ -1931,13 +2090,15 @@ class _Parser:
                 if index < stage:
                     raise OntologyError(
                         f"修饰符 {tok.value} 重复或顺序错误：应按 GROUP BY、"
-                        f"ORDER BY、LIMIT、OFFSET 的顺序各出现一次"
+                        f"HAVING、ORDER BY、LIMIT、OFFSET 的顺序各出现一次"
                         f"（字符位置 {tok.pos}）"
                     )
                 stage = index + 1
                 if tok.value == "GROUP":
                     group_pos = tok.pos
                     group_keys, i = self._parse_group_by(tokens, i)
+                elif tok.value == "HAVING":
+                    having, i = self._parse_having_clause(tokens, i)
                 elif tok.value == "ORDER":
                     order_keys, i = self._parse_order_by(tokens, i)
                 elif tok.value == "LIMIT":
@@ -1964,7 +2125,252 @@ class _Parser:
                 "分组查询不得使用星号投影 '*'（字符位置 "
                 f"{group_pos if group_pos is not None else 0}）"
             )
-        return (tuple(group_keys), tuple(order_keys), limit, offset)
+        return (tuple(group_keys), having, tuple(order_keys), limit, offset)
+
+    def _parse_having_clause(self, tokens: List[_Token], i: int):
+        """解析 HAVING 条件子句，tokens[i] 为 HAVING；返回 (子句, 下一索引)。
+
+        子句为 (关键字字符位置, 条件元组)；每个条件为：
+        - ("bound", 值, 位置)：BOUND(值)；
+        - ("not_bound", 值, 位置)：!BOUND(值)；
+        - ("cmp", 运算符, 左值, 右值, 位置)：比较条件。
+        值节点为 ("var", 变量名, 位置)、("agg", 聚合种类, 参数变量或 None,
+        位置)、("lit", 字符串, 位置) 或 ("int", 非负整数, 位置)；常量只允许
+        出现在比较的右操作数。多个条件用大写 AND 连接，按逻辑与筛选。
+        """
+        kw_pos = tokens[i].pos
+        i += 1
+        conditions = []
+        cond, i = self._parse_having_condition(tokens, i)
+        conditions.append(cond)
+        while (
+            i < len(tokens)
+            and tokens[i].kind == _TOK_NAME
+            and tokens[i].value == "AND"
+        ):
+            i += 1
+            cond, i = self._parse_having_condition(tokens, i)
+            conditions.append(cond)
+        if (
+            i < len(tokens)
+            and tokens[i].kind == _TOK_NAME
+            and tokens[i].value != tokens[i].value.upper()
+            and tokens[i].value.upper() == "AND"
+        ):
+            raise OntologyError(
+                f"关键字 {tokens[i].value!r} 大小写不合规：只接受大写形式"
+                f"（字符位置 {tokens[i].pos}）"
+            )
+        return (kw_pos, tuple(conditions)), i
+
+    def _parse_having_condition(self, tokens: List[_Token], i: int):
+        """解析单个 HAVING 条件，返回 (条件节点, 下一索引)。"""
+        if i >= len(tokens):
+            raise OntologyError(
+                f"HAVING 后缺少条件（字符位置 {len(self._text)}）"
+            )
+        tok = tokens[i]
+
+        # !BOUND(值)
+        if tok.kind == _TOK_BANG:
+            i += 1
+            if (
+                i >= len(tokens)
+                or tokens[i].kind != _TOK_NAME
+                or tokens[i].value != "BOUND"
+            ):
+                if (
+                    i < len(tokens)
+                    and tokens[i].kind == _TOK_NAME
+                    and tokens[i].value != tokens[i].value.upper()
+                    and tokens[i].value.upper() == "BOUND"
+                ):
+                    raise OntologyError(
+                        f"关键字 {tokens[i].value!r} 大小写不合规：只接受大写形式"
+                        f"（字符位置 {tokens[i].pos}）"
+                    )
+                raise OntologyError(
+                    f"HAVING 中 '!' 后只允许 BOUND(值) 形式"
+                    f"（字符位置 {tok.pos}）"
+                )
+            i += 1
+            value, i = self._parse_having_bound_value(tokens, i)
+            return ("not_bound", value, tok.pos), i
+
+        # BOUND(值)
+        if tok.kind == _TOK_NAME and tok.value == "BOUND":
+            i += 1
+            value, i = self._parse_having_bound_value(tokens, i)
+            return ("bound", value, tok.pos), i
+        if (
+            tok.kind == _TOK_NAME
+            and tok.value != tok.value.upper()
+            and tok.value.upper() == "BOUND"
+        ):
+            raise OntologyError(
+                f"关键字 {tok.value!r} 大小写不合规：只接受大写形式"
+                f"（字符位置 {tok.pos}）"
+            )
+
+        # 比较条件：左操作数必须是值（组键变量、聚合别名或匿名聚合调用）
+        left, i = self._parse_having_value(tokens, i, allow_constant=False)
+        if i >= len(tokens) or tokens[i].kind not in (
+            _TOK_EQ,
+            _TOK_NE,
+            _TOK_LT,
+            _TOK_LE,
+            _TOK_GT,
+            _TOK_GE,
+        ):
+            pos = tokens[i].pos if i < len(tokens) else len(self._text)
+            raise OntologyError(
+                "HAVING 比较条件需要 =、!=、<、<=、>、>= 运算符"
+                f"（字符位置 {pos}）"
+            )
+        op = tokens[i]
+        i += 1
+        right, i = self._parse_having_value(tokens, i, allow_constant=True)
+        return ("cmp", op.value, left, right, op.pos), i
+
+    def _parse_having_bound_value(self, tokens: List[_Token], i: int):
+        """消费 BOUND 后面的 '(' 值 ')'，返回 (值节点, 下一索引)。"""
+        if i >= len(tokens) or tokens[i].kind != _TOK_LPAREN:
+            pos = tokens[i].pos if i < len(tokens) else len(self._text)
+            raise OntologyError(f"BOUND 后缺少左圆括号 '('（字符位置 {pos}）")
+        i += 1
+        value, i = self._parse_having_value(tokens, i, allow_constant=False)
+        if i >= len(tokens) or tokens[i].kind != _TOK_RPAREN:
+            pos = tokens[i].pos if i < len(tokens) else len(self._text)
+            raise OntologyError(
+                f"BOUND(...) 缺少右圆括号 ')'（字符位置 {pos}）"
+            )
+        i += 1
+        return value, i
+
+    def _parse_having_value(self, tokens: List[_Token], i: int, allow_constant: bool):
+        """解析 HAVING 条件中的一个值或比较操作数，返回 (值节点, 下一索引)。
+
+        allow_constant 时（比较的右操作数）还接受字符串常量与非负整数常量。
+        """
+        if i >= len(tokens):
+            raise OntologyError(
+                f"HAVING 条件缺少操作数（字符位置 {len(self._text)}）"
+            )
+        tok = tokens[i]
+        if tok.kind == _TOK_VAR:
+            return ("var", tok.value, tok.pos), i + 1
+        if tok.kind == _TOK_NAME:
+            if tok.value in _AGGREGATE_WORDS:
+                return self._parse_having_aggregate(tokens, i)
+            if (
+                tok.value != tok.value.upper()
+                and tok.value.upper() in _AGGREGATE_WORDS + ("SUM", "AVG")
+            ):
+                raise OntologyError(
+                    f"关键字 {tok.value!r} 大小写不合规：只接受大写形式"
+                    f"（字符位置 {tok.pos}）"
+                )
+            if allow_constant and tok.value.isascii() and tok.value.isdigit():
+                return ("int", int(tok.value), tok.pos), i + 1
+            if i + 1 < len(tokens) and tokens[i + 1].kind == _TOK_LPAREN:
+                raise OntologyError(
+                    f"不支持的聚合函数 {tok.value!r}：仅支持 COUNT、MIN、MAX"
+                    f"（字符位置 {tok.pos}）"
+                )
+            expected = (
+                "HAVING 操作数只能是组键变量、聚合别名、聚合调用、字符串常量"
+                "或非负整数常量"
+                if allow_constant
+                else "HAVING 操作数只能是组键变量、聚合别名或聚合调用"
+            )
+            raise OntologyError(
+                f"{expected}，遇到 {tok.value!r}（字符位置 {tok.pos}）"
+            )
+        if allow_constant and tok.kind == _TOK_STRING:
+            return ("lit", tok.value, tok.pos), i + 1
+        raise OntologyError(
+            f"HAVING 条件中存在未知语句成分 {tok.value!r}（字符位置 {tok.pos}）"
+        )
+
+    def _parse_having_aggregate(self, tokens: List[_Token], i: int):
+        """解析 HAVING 中的匿名聚合调用（不带 AS 别名），tokens[i] 为函数名。
+
+        返回 (("agg", 聚合种类, 参数变量或 None, 位置), 下一索引)。
+        """
+        func = tokens[i]
+        i += 1
+        if i >= len(tokens) or tokens[i].kind != _TOK_LPAREN:
+            pos = tokens[i].pos if i < len(tokens) else len(self._text)
+            raise OntologyError(
+                f"{func.value} 后缺少左圆括号 '('（字符位置 {pos}）"
+            )
+        i += 1
+
+        distinct = False
+        if i < len(tokens) and tokens[i].kind == _TOK_NAME and tokens[i].value == "DISTINCT":
+            distinct = True
+            i += 1
+        elif (
+            i < len(tokens)
+            and tokens[i].kind == _TOK_NAME
+            and tokens[i].value != tokens[i].value.upper()
+            and tokens[i].value.upper() == "DISTINCT"
+        ):
+            raise OntologyError(
+                f"关键字 {tokens[i].value!r} 大小写不合规：只接受大写形式"
+                f"（字符位置 {tokens[i].pos}）"
+            )
+
+        if i >= len(tokens):
+            raise OntologyError(
+                f"{func.value}(...) 的聚合参数不完整（字符位置 {func.pos}）"
+            )
+        arg_tok = tokens[i]
+
+        if func.value == "COUNT":
+            if distinct:
+                if arg_tok.kind != _TOK_VAR:
+                    raise OntologyError(
+                        f"COUNT(DISTINCT ...) 中必须且只能出现一个变量，"
+                        f"遇到 {arg_tok.value!r}（字符位置 {arg_tok.pos}）"
+                    )
+                kind = _AGG_COUNT_DISTINCT
+                operand = arg_tok.value
+            elif arg_tok.kind == _TOK_STAR:
+                kind = _AGG_COUNT
+                operand = None
+            elif arg_tok.kind == _TOK_VAR:
+                kind = _AGG_COUNT
+                operand = arg_tok.value
+            else:
+                raise OntologyError(
+                    f"COUNT 的参数形式非法：只接受 '*'、?变量 或 DISTINCT ?变量，"
+                    f"遇到 {arg_tok.value!r}（字符位置 {arg_tok.pos}）"
+                )
+        else:
+            if distinct:
+                raise OntologyError(
+                    f"{func.value} 不支持 DISTINCT 参数：只接受单个变量"
+                    f"（字符位置 {arg_tok.pos}）"
+                )
+            if arg_tok.kind != _TOK_VAR:
+                raise OntologyError(
+                    f"{func.value} 的参数形式非法：括号内必须且只能出现一个变量，"
+                    f"遇到 {arg_tok.value!r}（字符位置 {arg_tok.pos}）"
+                )
+            kind = _AGG_MIN if func.value == "MIN" else _AGG_MAX
+            operand = arg_tok.value
+        i += 1
+
+        if i >= len(tokens) or tokens[i].kind != _TOK_RPAREN:
+            pos = tokens[i].pos if i < len(tokens) else len(self._text)
+            raise OntologyError(
+                f"{func.value} 聚合参数或嵌套形式非法：参数只能是 '*'、"
+                f"DISTINCT ?变量 或单个变量，圆括号内存在多余或缺少成分"
+                f"（字符位置 {pos}）"
+            )
+        i += 1
+        return ("agg", kind, operand, func.pos), i
 
     def _parse_group_by(self, tokens: List[_Token], i: int):
         """解析 GROUP BY 分组键列表，tokens[i] 为 GROUP；返回 (分组键, 下一索引)。
@@ -2362,14 +2768,16 @@ def run_query(model, text) -> QueryResult:
     投影顺序由组键值与聚合结果构成：COUNT(*) 统计组内解数（非负整数），
     COUNT(?v) 只统计 ?v 已绑定的解，COUNT(DISTINCT ?v) 再按绑定值去重；
     MIN(?v)/MAX(?v) 在组内已绑定的字符串值中按 Unicode 字典序取最小/
-    最大，无已绑定时为 None。
+    最大，无已绑定时为 None。有 HAVING 时在分组聚合完成后逐组筛选，
+    被过滤的组不参与后续去重、排序、OFFSET 与 LIMIT；没有组通过时
+    返回空 QueryResult。
 
     两条路径都先按投影去重并字典序排序，再有 ORDER BY 时做稳定排序
     （同键未绑定值先于绑定值，DESC 相反；多键按出现顺序比较，全相同
     则保留投影字典序），最后跳过 OFFSET 条并保留至多 LIMIT 条。
     """
     properties = frozenset(getattr(model, "declared_properties", ()))
-    head, clauses, star, (group_keys, order_keys, limit, offset) = (
+    head, clauses, star, (group_keys, having, order_keys, limit, offset) = (
         _compile_query(text, properties)
     )
 
@@ -2378,7 +2786,7 @@ def run_query(model, text) -> QueryResult:
 
     has_aggregate = any(item[0] == "a" for item in head)
     if not star and (has_aggregate or group_keys):
-        rows = _aggregate_bindings(head, group_keys, bindings)
+        rows = _aggregate_bindings(head, group_keys, bindings, having)
         projection = tuple(item[1] for item in head)
     else:
         if star:
@@ -2408,12 +2816,13 @@ def run_query(model, text) -> QueryResult:
     return QueryResult(projection, tuple(ordered))
 
 
-def _aggregate_bindings(head, group_keys, bindings):
+def _aggregate_bindings(head, group_keys, bindings, having=None):
     """把求值得到的绑定按组键分组并计算聚合，返回行集合（未排序）。
 
     组键在绑定中未绑定时以 None 作为组值，所有未绑定解归入同一组。
     无 GROUP BY 时所有解属于同一个组，且即使解列表为空也产生一行；
-    有 GROUP BY 但没有任何解时不产生行。
+    有 GROUP BY 但没有任何解时不产生行。有 HAVING 时在聚合完成后逐组
+    筛选，被过滤的组不进入行集合。
     """
     key_names = tuple(name for name, _pos in group_keys)
     aggs = [item for item in head if item[0] == "a"]
@@ -2430,15 +2839,78 @@ def _aggregate_bindings(head, group_keys, bindings):
     rows = set()
     for key, members in groups.items():
         key_values = dict(zip(key_names, key))
+        alias_values = {
+            alias: _compute_aggregate(kind, operand, members)
+            for _tag, alias, kind, operand, _pos in aggs
+        }
+        if having is not None and not _eval_having(
+            having, key_values, alias_values, members
+        ):
+            continue
         row = []
         for item in head:
             if item[0] == "v":
                 row.append(key_values.get(item[1]))
             else:
-                _tag, alias, kind, operand, _pos = item
-                row.append(_compute_aggregate(kind, operand, members))
+                row.append(alias_values[item[1]])
         rows.add(tuple(row))
     return rows
+
+
+def _eval_having(having, key_values: dict, alias_values: dict, members: List[dict]) -> bool:
+    """逐组执行 HAVING：全部条件按逻辑与满足时该组通过，否则被过滤。"""
+    _kw_pos, conditions = having
+    for cond in conditions:
+        kind = cond[0]
+        if kind == "bound":
+            if _having_value(cond[1], key_values, alias_values, members) is None:
+                return False
+            continue
+        if kind == "not_bound":
+            if _having_value(cond[1], key_values, alias_values, members) is not None:
+                return False
+            continue
+        _tag, op, left_node, right_node, _pos = cond
+        left = _having_value(left_node, key_values, alias_values, members)
+        right = _having_value(right_node, key_values, alias_values, members)
+        if not _compare_having(op, left, right):
+            return False
+    return True
+
+
+def _having_value(node, key_values: dict, alias_values: dict, members: List[dict]):
+    """解析 HAVING 值节点：组键变量取组键值，聚合别名取该组的投影聚合
+    结果，匿名聚合调用在该组解序列上即时计算，常量原样返回。"""
+    tag = node[0]
+    if tag == "var":
+        name = node[1]
+        if name in key_values:
+            return key_values[name]
+        return alias_values.get(name)
+    if tag == "agg":
+        return _compute_aggregate(node[1], node[2], members)
+    return node[1]  # "lit" 字符串常量 / "int" 非负整数常量
+
+
+def _compare_having(op: str, left, right) -> bool:
+    """HAVING 比较：任一操作数为 None（含组键未绑定）时为假；数字按数值、
+    字符串按 Unicode 字典序比较；非 None 混合类型时 = 与顺序比较为假、
+    != 为真。"""
+    if left is None or right is None:
+        return False
+    if type(left) is not type(right):
+        return op == "!="
+    if op == "=":
+        return left == right
+    if op == "!=":
+        return left != right
+    if op == "<":
+        return left < right
+    if op == "<=":
+        return left <= right
+    if op == ">":
+        return left > right
+    return left >= right
 
 
 def _compute_aggregate(kind: str, operand, members: List[dict]):
