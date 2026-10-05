@@ -96,6 +96,11 @@ class ValidationReport:
           (first, property, second) 与 (second, property, first)，first/second
           为无序节点对按字典序排列后的两端；自反违反时两项指向同一事实
           (subject, property, subject)。
+        - inverseFunctionalPropertyValue：两项分别证明同一宾语被两个不同
+          主语指向的事实 (first, property, object) 与
+          (second, property, object)，first/second 为按字典序排列的主语。
+        - irreflexivePropertySelf：两项指向同一自反事实
+          (subject, property, subject)。
 
         显式事实的证明元组恰含一个 kind 为 "explicit"、ruleId 为 None、
         premises 为空的 Proof；推理事实的证明元组为 OntologyModel.explain

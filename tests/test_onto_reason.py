@@ -1968,6 +1968,484 @@ class AsymmetricInconsistencyTests(unittest.TestCase):
         self.assertEqual(len(model.triples), 2)
 
 
+class InverseFunctionalIrreflexiveStructureTests(unittest.TestCase):
+    """inverseFunctionalProperties / irreflexiveProperties 的结构校验。"""
+
+    def test_optional_fields_accepted_when_omitted_or_empty(self):
+        old = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [],
+            "functionalProperties": [],
+        }
+        self.assertIsNotNone(parse(consistency_doc(consistency=old)))
+        empty = dict(
+            old, inverseFunctionalProperties=[], irreflexiveProperties=[]
+        )
+        self.assertIsNotNone(parse(consistency_doc(consistency=empty)))
+
+    def test_item_validation(self):
+        for field in ("inverseFunctionalProperties", "irreflexiveProperties"):
+            base = {
+                "classMembershipPredicate": "rdfType",
+                "disjointClasses": [],
+                "functionalProperties": [],
+                field: [{"id": "n1"}],
+            }
+            with self.assertRaises(OntologyError) as ctx:
+                parse(consistency_doc(consistency=base))
+            self.assertIn(f"consistency['{field}'][0]", str(ctx.exception))
+
+            base[field] = [{"id": "n1", "property": ""}]
+            with self.assertRaises(OntologyError) as ctx:
+                parse(consistency_doc(consistency=base))
+            self.assertIn("property", str(ctx.exception))
+
+            base[field] = [{"id": "n1", "property": "nope"}]
+            with self.assertRaises(OntologyError) as ctx:
+                parse(consistency_doc(consistency=base))
+            self.assertIn("nope", str(ctx.exception))
+            self.assertIn("未声明的属性", str(ctx.exception))
+
+            base[field] = [{"id": "", "property": "knows"}]
+            with self.assertRaises(OntologyError) as ctx:
+                parse(consistency_doc(consistency=base))
+            self.assertIn(f"consistency['{field}'][0]", str(ctx.exception))
+            self.assertIn("'id'", str(ctx.exception))
+
+            base[field] = [{"id": True, "property": "knows"}]
+            with self.assertRaises(OntologyError) as ctx:
+                parse(consistency_doc(consistency=base))
+            self.assertIn("'id'", str(ctx.exception))
+
+            base[field] = [{"id": 1, "property": "knows", "extra": 2}]
+            with self.assertRaises(OntologyError) as ctx:
+                parse(consistency_doc(consistency=base))
+            self.assertIn("extra", str(ctx.exception))
+            self.assertIn(f"consistency['{field}'][0]", str(ctx.exception))
+
+    def test_array_wrong_type_and_non_object_items(self):
+        for field in ("inverseFunctionalProperties", "irreflexiveProperties"):
+            bad_array = {
+                "classMembershipPredicate": "rdfType",
+                "disjointClasses": [],
+                "functionalProperties": [],
+                field: {},
+            }
+            with self.assertRaises(OntologyError) as ctx:
+                parse(consistency_doc(consistency=bad_array))
+            self.assertIn(field, str(ctx.exception))
+
+            bad_item = dict(bad_array, **{field: [42]})
+            with self.assertRaises(OntologyError) as ctx:
+                parse(consistency_doc(consistency=bad_item))
+            self.assertIn(f"consistency['{field}'][0]", str(ctx.exception))
+
+    def test_ids_unique_across_all_constraint_arrays(self):
+        consistency = {
+            "classMembershipPredicate": "rdfType",
+            "disjointClasses": [],
+            "functionalProperties": [{"id": 7, "property": "knows"}],
+            "inverseFunctionalProperties": [{"id": 7, "property": "likes"}],
+        }
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=consistency))
+        self.assertIn("7", str(ctx.exception))
+        self.assertIn("重复", str(ctx.exception))
+
+        # 两个新数组之间同样去重
+        consistency["functionalProperties"] = []
+        consistency["irreflexiveProperties"] = [{"id": 7, "property": "knows"}]
+        with self.assertRaises(OntologyError) as ctx:
+            parse(consistency_doc(consistency=consistency))
+        self.assertIn("重复", str(ctx.exception))
+
+        # 整数 7 与字符串 "7" 不重复
+        consistency["irreflexiveProperties"] = [{"id": "7", "property": "knows"}]
+        self.assertIsNotNone(parse(consistency_doc(consistency=consistency)))
+
+
+class InverseFunctionalInconsistencyTests(unittest.TestCase):
+    """inverseFunctionalProperties 在 parse 入口上的违反检测。"""
+
+    def section(self, **overrides):
+        base = consistency_section()
+        base.update(overrides)
+        return base
+
+    def test_two_subjects_same_object_conflict(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+        ]
+        section = self.section(
+            inverseFunctionalProperties=[{"id": "i1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        message = str(ctx.exception)
+        self.assertIn("inverseFunctionalProperties id='i1'", message)
+        self.assertIn("knows", message)
+        self.assertIn("carol", message)
+        self.assertIn("alice", message)
+        self.assertIn("bob", message)
+        # 主语按字典序：alice 先于 bob
+        self.assertLess(message.index("'alice'"), message.index("'bob'"))
+        self.assertIn("explicit_triples", message)
+
+    def test_single_subject_is_consistent(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+        ]
+        section = self.section(
+            inverseFunctionalProperties=[{"id": "i1", "property": "knows"}]
+        )
+        model = parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(len(model.triples), 2)
+
+    def test_unordered_subject_pair_reported_once(self):
+        triples = [
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+        ]
+        section = self.section(
+            inverseFunctionalProperties=[{"id": "i1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(
+            str(ctx.exception).count("[inverseFunctionalProperties id='i1']"), 1
+        )
+
+    def test_derived_fact_detected_with_rule_source(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "likes", "object": "carol"},
+        ]
+        rules = [
+            {
+                "id": "r-like-knows",
+                "if": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            }
+        ]
+        section = self.section(
+            inverseFunctionalProperties=[{"id": "i1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(
+                consistency_doc(triples=triples, rules=rules, consistency=section)
+            )
+        message = str(ctx.exception)
+        self.assertIn("derived_triples", message)
+        self.assertIn("r-like-knows", message)
+        self.assertIn("explicit_triples", message)
+
+    def test_omitted_or_empty_leaves_shared_object_consistent(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+        ]
+        model = parse(
+            consistency_doc(triples=triples, consistency=self.section())
+        )
+        self.assertEqual(len(model.triples), 2)
+        section = self.section(inverseFunctionalProperties=[])
+        model = parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(len(model.triples), 2)
+
+
+class IrreflexiveInconsistencyTests(unittest.TestCase):
+    """irreflexiveProperties 在 parse 入口上的自反违反检测。"""
+
+    def section(self, **overrides):
+        base = consistency_section()
+        base.update(overrides)
+        return base
+
+    def test_self_loop_conflict(self):
+        triples = [
+            {"subject": "carol", "predicate": "knows", "object": "carol"},
+        ]
+        section = self.section(
+            irreflexiveProperties=[{"id": "ir1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(consistency_doc(triples=triples, consistency=section))
+        message = str(ctx.exception)
+        # 自反只报告一次
+        self.assertEqual(message.count("[irreflexiveProperties id='ir1']"), 1)
+        self.assertIn("carol", message)
+        self.assertIn("knows", message)
+        self.assertIn("explicit_triples", message)
+
+    def test_non_reflexive_triples_are_consistent(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+        ]
+        section = self.section(
+            irreflexiveProperties=[{"id": "ir1", "property": "knows"}]
+        )
+        model = parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(len(model.triples), 2)
+
+    def test_derived_self_loop_detected_with_rule_source(self):
+        triples = [
+            {"subject": "alice", "predicate": "likes", "object": "bob"},
+        ]
+        rules = [
+            {
+                "id": "r-self",
+                "if": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "knows", "object": "?x"}],
+            }
+        ]
+        section = self.section(
+            irreflexiveProperties=[{"id": "ir1", "property": "knows"}]
+        )
+        with self.assertRaises(InconsistencyError) as ctx:
+            parse(
+                consistency_doc(triples=triples, rules=rules, consistency=section)
+            )
+        message = str(ctx.exception)
+        self.assertIn("derived_triples", message)
+        self.assertIn("r-self", message)
+
+    def test_omitted_or_empty_leaves_self_loop_consistent(self):
+        triples = [
+            {"subject": "carol", "predicate": "knows", "object": "carol"},
+        ]
+        model = parse(
+            consistency_doc(triples=triples, consistency=self.section())
+        )
+        self.assertEqual(len(model.triples), 1)
+        section = self.section(irreflexiveProperties=[])
+        model = parse(consistency_doc(triples=triples, consistency=section))
+        self.assertEqual(len(model.triples), 1)
+
+
+class InverseFunctionalIrreflexiveDiagnoseTests(unittest.TestCase):
+    """两类新约束在 diagnose / explain_diagnostic 上的结构化诊断。"""
+
+    def diagnose(self, doc):
+        return OntologyEngine().diagnose(json.dumps(doc))
+
+    def section(self, **overrides):
+        base = consistency_section()
+        base.update(overrides)
+        return base
+
+    def test_inverse_functional_diagnostic_shape(self):
+        triples = [
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+        ]
+        section = self.section(
+            inverseFunctionalProperties=[{"id": "i1", "property": "knows"}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        self.assertFalse(report.is_consistent)
+        self.assertIsNone(report.model)
+        (diagnostic,) = report.diagnostics
+        self.assertEqual(
+            set(diagnostic),
+            {"kind", "constraintId", "subject", "evidence", "message"},
+        )
+        self.assertEqual(diagnostic["kind"], "inverseFunctionalPropertyValue")
+        self.assertEqual(diagnostic["constraintId"], "i1")
+        # subject 为共同宾语
+        self.assertEqual(diagnostic["subject"], "carol")
+        evidence = diagnostic["evidence"]
+        self.assertIsInstance(evidence, tuple)
+        self.assertEqual(len(evidence), 2)
+        for item in evidence:
+            self.assertEqual(set(item), {"object", "source"})
+        # 两项按主语字典序排列
+        self.assertEqual(
+            [item["object"] for item in evidence], ["alice", "bob"]
+        )
+        for item in evidence:
+            self.assertEqual(item["source"], {"kind": "explicit"})
+
+    def test_inverse_functional_derived_source_keeps_rule_id(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "likes", "object": "carol"},
+        ]
+        rules = [
+            {
+                "id": 11,
+                "if": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            }
+        ]
+        section = self.section(
+            inverseFunctionalProperties=[{"id": "i1", "property": "knows"}]
+        )
+        report = self.diagnose(
+            consistency_doc(triples=triples, rules=rules, consistency=section)
+        )
+        (diagnostic,) = report.diagnostics
+        by_object = {item["object"]: item["source"] for item in diagnostic["evidence"]}
+        self.assertEqual(by_object["alice"], {"kind": "explicit"})
+        self.assertEqual(by_object["bob"], {"kind": "derived", "ruleId": 11})
+        self.assertIsInstance(by_object["bob"]["ruleId"], int)
+
+    def test_inverse_functional_pairs_deduplicated_and_sorted(self):
+        triples = [
+            {"subject": "s3", "predicate": "knows", "object": "o"},
+            {"subject": "s1", "predicate": "knows", "object": "o"},
+            {"subject": "s2", "predicate": "knows", "object": "o"},
+            {"subject": "s1", "predicate": "knows", "object": "o"},
+        ]
+        section = self.section(
+            inverseFunctionalProperties=[{"id": "i1", "property": "knows"}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        pairs = [
+            tuple(item["object"] for item in d["evidence"])
+            for d in report.diagnostics
+        ]
+        self.assertEqual(pairs, [("s1", "s2"), ("s1", "s3"), ("s2", "s3")])
+
+    def test_irreflexive_diagnostic_shape(self):
+        triples = [
+            {"subject": "carol", "predicate": "knows", "object": "carol"},
+        ]
+        section = self.section(
+            irreflexiveProperties=[{"id": 4, "property": "knows"}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        (diagnostic,) = report.diagnostics
+        self.assertEqual(
+            set(diagnostic),
+            {"kind", "constraintId", "subject", "evidence", "message"},
+        )
+        self.assertEqual(diagnostic["kind"], "irreflexivePropertySelf")
+        self.assertEqual(diagnostic["constraintId"], 4)
+        self.assertIsInstance(diagnostic["constraintId"], int)
+        self.assertEqual(diagnostic["subject"], "carol")
+        evidence = diagnostic["evidence"]
+        self.assertEqual(len(evidence), 2)
+        # 两项指向同一事实
+        for item in evidence:
+            self.assertEqual(set(item), {"subject", "object", "source"})
+            self.assertEqual(item["subject"], "carol")
+            self.assertEqual(item["object"], "carol")
+            self.assertEqual(item["source"], {"kind": "explicit"})
+
+    def test_new_groups_sorted_after_asymmetric_and_match_parse_lines(self):
+        triples = [
+            {"subject": "alice", "predicate": "rdfType", "object": "Person"},
+            {"subject": "alice", "predicate": "rdfType", "object": "Robot"},
+            {"subject": "alice", "predicate": "knows", "object": "bob"},
+            {"subject": "bob", "predicate": "knows", "object": "alice"},
+            {"subject": "alice", "predicate": "likes", "object": "carol"},
+            {"subject": "bob", "predicate": "likes", "object": "carol"},
+            {"subject": "carol", "predicate": "likes", "object": "carol"},
+        ]
+        section = self.section(
+            disjointClasses=[{"id": "d1", "classes": ["Person", "Robot"]}],
+            asymmetricProperties=[{"id": "a1", "property": "knows"}],
+            inverseFunctionalProperties=[{"id": "i1", "property": "likes"}],
+            irreflexiveProperties=[{"id": "ir1", "property": "likes"}],
+        )
+        doc = consistency_doc(triples=triples, consistency=section)
+        text = json.dumps(doc)
+        report = OntologyEngine().diagnose(text)
+        with self.assertRaises(InconsistencyError) as ctx:
+            OntologyEngine().parse(text)
+        lines = str(ctx.exception).splitlines()
+        self.assertEqual(
+            lines[0], f"本体一致性诊断发现 {len(report.diagnostics)} 处冲突："
+        )
+        self.assertEqual(
+            [d["message"] for d in report.diagnostics], lines[1:]
+        )
+        kinds = [d["kind"] for d in report.diagnostics]
+        # carol 也被 alice/bob/carol 三者指向：逆函数型冲突按主语对列出三对
+        self.assertEqual(
+            kinds,
+            [
+                "disjointClassMembership",
+                "asymmetricPropertyPair",
+                "inverseFunctionalPropertyValue",
+                "inverseFunctionalPropertyValue",
+                "inverseFunctionalPropertyValue",
+                "irreflexivePropertySelf",
+            ],
+        )
+
+    def test_inverse_functional_explain_diagnostic(self):
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "likes", "object": "carol"},
+        ]
+        rules = [
+            {
+                "id": "r-lk",
+                "if": [{"subject": "?x", "predicate": "likes", "object": "?y"}],
+                "then": [{"subject": "?x", "predicate": "knows", "object": "?y"}],
+            }
+        ]
+        section = self.section(
+            inverseFunctionalProperties=[{"id": "i1", "property": "knows"}]
+        )
+        report = self.diagnose(
+            consistency_doc(triples=triples, rules=rules, consistency=section)
+        )
+        first_proofs, second_proofs = report.explain_diagnostic(0)
+        # 第一项：alice 的显式事实
+        self.assertEqual(len(first_proofs), 1)
+        self.assertEqual(first_proofs[0].kind, "explicit")
+        self.assertIsNone(first_proofs[0].ruleId)
+        self.assertEqual(first_proofs[0].premises, ())
+        self.assertEqual(
+            first_proofs[0].triple, Triple("alice", "knows", "carol")
+        )
+        # 第二项：bob 经规则 r-lk 推出的完整证明
+        self.assertEqual(len(second_proofs), 1)
+        derived = second_proofs[0]
+        self.assertEqual(derived.kind, "rule")
+        self.assertEqual(derived.ruleId, "r-lk")
+        self.assertEqual(derived.triple, Triple("bob", "knows", "carol"))
+        self.assertEqual(
+            [premise.triple for premise in derived.premises],
+            [Triple("bob", "likes", "carol")],
+        )
+        self.assertTrue(all(p.kind == "explicit" for p in derived.premises))
+
+    def test_irreflexive_explain_diagnostic_points_to_same_fact(self):
+        triples = [
+            {"subject": "carol", "predicate": "knows", "object": "carol"},
+        ]
+        section = self.section(
+            irreflexiveProperties=[{"id": "ir1", "property": "knows"}]
+        )
+        report = self.diagnose(consistency_doc(triples=triples, consistency=section))
+        first_proofs, second_proofs = report.explain_diagnostic(0)
+        self.assertEqual(first_proofs, second_proofs)
+        self.assertEqual(len(first_proofs), 1)
+        proof = first_proofs[0]
+        self.assertEqual(proof.kind, "explicit")
+        self.assertEqual(proof.triple, Triple("carol", "knows", "carol"))
+
+    def test_no_new_constraints_means_no_new_diagnostics(self):
+        # 互反、共宾语与自反事实在未声明新约束时不产生额外诊断
+        triples = [
+            {"subject": "alice", "predicate": "knows", "object": "carol"},
+            {"subject": "bob", "predicate": "knows", "object": "carol"},
+            {"subject": "carol", "predicate": "likes", "object": "carol"},
+        ]
+        report = self.diagnose(
+            consistency_doc(triples=triples, consistency=consistency_section())
+        )
+        self.assertTrue(report.is_consistent)
+        self.assertEqual(report.diagnostics, ())
+
+
 class DiagnoseApiTests(unittest.TestCase):
     """OntologyEngine.diagnose 与 ValidationReport 的结构化诊断行为。"""
 
